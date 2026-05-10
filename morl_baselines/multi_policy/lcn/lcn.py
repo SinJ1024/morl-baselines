@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import wandb
 
 from morl_baselines.common.evaluation import log_all_multi_policy_metrics
+from morl_baselines.multi_policy.lcn.lambda_scheduler import LambdaScheduler
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
 from morl_baselines.common.pareto import get_non_dominated_inds
 from morl_baselines.common.performance_indicators import hypervolume
@@ -85,6 +86,7 @@ class Transition:
     reward: np.ndarray
     next_observation: np.ndarray
     terminal: bool
+    cell_index: int = -1
 
 
 class LCNTNDPModel(BasePCNModel):
@@ -141,6 +143,12 @@ class LCNTNDP(MOAgent, MOPolicy):
         noise: float = 0.1,
         distance_ref: str = 'nondominated',
         lcn_lambda: float = None,
+        lambda_schedule: str = 'constant',
+        lambda_start: float = 1.0,
+        lambda_end: float = None,
+        lambda_warmup_fraction: float = 0.0,
+        lambda_freeze_fraction: float = 0.1,
+        spatial_alpha: float = 0.0,
         project_name: str = "MORL-Baselines",
         experiment_name: str = "LCN",
         wandb_entity: Optional[str] = None,
@@ -181,6 +189,14 @@ class LCNTNDP(MOAgent, MOPolicy):
         self.hidden_dim = hidden_dim
         self.distance_ref = distance_ref
         self.lcn_lambda = lcn_lambda
+        self.lambda_schedule = lambda_schedule
+        self.lambda_start = lambda_start
+        self.lambda_end = lambda_end if lambda_end is not None else lcn_lambda
+        self.lambda_warmup_fraction = lambda_warmup_fraction
+        self.lambda_freeze_fraction = lambda_freeze_fraction
+        self.spatial_alpha = spatial_alpha
+        self.demand_context = None
+        self.lambda_scheduler = None
         self.scaling_factor = scaling_factor
         self.desired_return = None
         self.desired_horizon = None
@@ -273,6 +289,23 @@ class LCNTNDP(MOAgent, MOPolicy):
         else:
             heapq.heappush(self.experience_replay, (1, step, transitions))
 
+    def _compute_route_contexts(self):
+        """Compute normalized demand context for each episode in the ER buffer.
+
+        Returns: array of shape (len(experience_replay),) with values in [0, 1].
+        """
+        if self.demand_context is None:
+            return np.zeros(len(self.experience_replay))
+        contexts = []
+        for ep in self.experience_replay:
+            transitions = ep[2]
+            cell_indices = [t.cell_index for t in transitions if t.cell_index >= 0]
+            if cell_indices:
+                contexts.append(np.mean(self.demand_context[cell_indices]))
+            else:
+                contexts.append(0.0)
+        return np.array(contexts)
+
     def _nlargest(self, n, threshold=0.2):
         """See Section 4.4 of https://arxiv.org/pdf/2204.05036.pdf for details."""
         returns = np.array([e[2][0].reward for e in self.experience_replay])
@@ -333,8 +366,14 @@ class LCNTNDP(MOAgent, MOPolicy):
             non_dominated_i = get_non_dominated_inds(returns)
             non_dominated = returns[non_dominated_i]
             ginis = gini(non_dominated, normalized=True)
-            # Filter out the ND points whose gini is > lamda (or the min gini)
-            non_dominated_i = ginis <= self.lcn_lambda
+            # Per-episode effective lambda for gini threshold
+            if self.spatial_alpha > 0 and self.demand_context is not None:
+                route_contexts = self._compute_route_contexts()
+                nd_contexts = route_contexts[np.nonzero(get_non_dominated_inds(returns))[0]]
+                effective_lambdas_nd = np.maximum(self.lcn_lambda, self.spatial_alpha * nd_contexts)
+                non_dominated_i = ginis <= effective_lambdas_nd
+            else:
+                non_dominated_i = ginis <= self.lcn_lambda
             # If no solution is left after filtering, take the ones with the lowest gini
             if sum(non_dominated_i) == 0:
                 threshold = np.min(ginis)
@@ -359,8 +398,13 @@ class LCNTNDP(MOAgent, MOPolicy):
             assert self.lcn_lambda is not None, "lcn_lambda must be set when using distance_ref='interpolate2'"
 
             lv = lorenz_vector(np.array(returns))
-            # The final vector is a weighted average of the lorenz vector and the full returns
-            fv = self.lcn_lambda * returns + (1 - self.lcn_lambda) * lv
+            # Per-episode effective lambda for weighted interpolation
+            if self.spatial_alpha > 0 and self.demand_context is not None:
+                route_contexts = self._compute_route_contexts()
+                effective_lambdas = np.maximum(self.lcn_lambda, self.spatial_alpha * route_contexts)
+                fv = effective_lambdas[:, np.newaxis] * returns + (1 - effective_lambdas[:, np.newaxis]) * lv
+            else:
+                fv = self.lcn_lambda * returns + (1 - self.lcn_lambda) * lv
 
             non_dominated_i = get_non_dominated_inds(fv)
             non_dominated = returns[non_dominated_i]
@@ -380,14 +424,19 @@ class LCNTNDP(MOAgent, MOPolicy):
             l2[duplicates] -= 1e-5
             l2[sma] *= 2
         elif self.distance_ref == 'interpolate3':
-            assert self.lcn_lambda is not None, "lcn_lambda must be set when using distance_ref='interpolate2'"
+            assert self.lcn_lambda is not None, "lcn_lambda must be set when using distance_ref='interpolate3'"
 
             # sort returns in increasing order
             returns = np.sort(returns, axis=1)
-            
+
             lv = lorenz_vector(np.array(returns))
-            # The final vector is a weighted average of the lorenz vector and the full returns
-            fv = self.lcn_lambda * returns + (1 - self.lcn_lambda) * lv
+            # Per-episode effective lambda for weighted interpolation
+            if self.spatial_alpha > 0 and self.demand_context is not None:
+                route_contexts = self._compute_route_contexts()
+                effective_lambdas = np.maximum(self.lcn_lambda, self.spatial_alpha * route_contexts)
+                fv = effective_lambdas[:, np.newaxis] * returns + (1 - effective_lambdas[:, np.newaxis]) * lv
+            else:
+                fv = self.lcn_lambda * returns + (1 - self.lcn_lambda) * lv
 
             non_dominated_i = get_non_dominated_inds(fv)
             non_dominated = returns[non_dominated_i]
@@ -482,6 +531,7 @@ class LCNTNDP(MOAgent, MOPolicy):
             n_obs = n_state
             done = terminated or truncated
 
+            cell_idx = info.get('location_grid_index', -1)
             transitions.append(
                 Transition(
                     observation=obs,
@@ -490,6 +540,7 @@ class LCNTNDP(MOAgent, MOPolicy):
                     reward=np.float32(reward).copy(),
                     next_observation=n_obs,
                     terminal=terminated,
+                    cell_index=cell_idx,
                 )
             )
 
@@ -519,16 +570,23 @@ class LCNTNDP(MOAgent, MOPolicy):
         horizons = np.float32(horizons)
         e_returns = []
         e_states = []
+        e_cell_satisfaction = []
+        city = env.unwrapped.city if hasattr(env.unwrapped, 'city') else None
         for i in range(n):
             transitions, states = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, starting_loc=starting_loc, eval_mode=True)
             # compute return
-            for i in reversed(range(len(transitions) - 1)):
-                transitions[i].reward += self.gamma * transitions[i + 1].reward
+            for j in reversed(range(len(transitions) - 1)):
+                transitions[j].reward += self.gamma * transitions[j + 1].reward
             e_returns.append(transitions[0].reward)
             e_states.append(states)
 
+            if city is not None:
+                line_indices = city.grid_to_index(np.array(states))
+                sat_rates, _ = city.compute_cell_satisfaction(line_indices)
+                e_cell_satisfaction.append(sat_rates)
+
         distances = np.linalg.norm(np.array(returns) - np.array(e_returns), axis=-1)
-        return np.array(e_returns), np.array(returns), distances, e_states
+        return np.array(e_returns), np.array(returns), distances, e_states, e_cell_satisfaction
 
     def save(self, filename: str = "LCN_model", savedir: str = "weights"):
         """Save LCN."""
@@ -592,12 +650,34 @@ class LCNTNDP(MOAgent, MOPolicy):
                     "num_policies": n_policies,
                     "save_dir": save_dir, 
                     "nr_stations": nr_stations, 
-                    "distance_ref": self.distance_ref, 
+                    "distance_ref": self.distance_ref,
                     "lcn_lambda": self.lcn_lambda,
                     "cd_threshold": cd_threshold,
+                    "lambda_schedule": self.lambda_schedule,
+                    "lambda_start": self.lambda_start,
+                    "lambda_end": self.lambda_end,
+                    "lambda_warmup_fraction": self.lambda_warmup_fraction,
+                    "lambda_freeze_fraction": self.lambda_freeze_fraction,
+                    "spatial_alpha": self.spatial_alpha,
                 }
-            ) 
+            )
         self.global_step = 0
+
+        if self.lambda_schedule != 'constant' and self.lcn_lambda is not None:
+            self.lambda_scheduler = LambdaScheduler(
+                schedule_type=self.lambda_schedule,
+                lambda_start=self.lambda_start,
+                lambda_end=self.lambda_end,
+                total_timesteps=total_timesteps,
+                warmup_fraction=self.lambda_warmup_fraction,
+                freeze_fraction=self.lambda_freeze_fraction,
+            )
+            self.lcn_lambda = self.lambda_start
+
+        if hasattr(self.env.unwrapped, 'city'):
+            agg_od = self.env.unwrapped.city.agg_od_mx().flatten()
+            max_od = agg_od.max()
+            self.demand_context = agg_od / max_od if max_od > 0 else agg_od
         total_episodes = num_er_episodes
         n_checkpoints = 0
         self.cd_threshold = cd_threshold
@@ -611,7 +691,8 @@ class LCNTNDP(MOAgent, MOPolicy):
             while not done:
                 action = self.env.action_space.sample(mask=info['action_mask'])
                 n_obs, reward, terminated, truncated, info = self.env.step(action)
-                transitions.append(Transition(obs, action, info['action_mask'], np.float32(reward).copy(), n_obs, terminated))
+                cell_idx = info.get('location_grid_index', -1)
+                transitions.append(Transition(obs, action, info['action_mask'], np.float32(reward).copy(), n_obs, terminated, cell_index=cell_idx))
                 done = terminated or truncated
                 obs = n_obs
                 self.global_step += 1
@@ -620,6 +701,11 @@ class LCNTNDP(MOAgent, MOPolicy):
 
         returns = None
         while self.global_step < total_timesteps:
+            if self.lambda_scheduler is not None:
+                self.lcn_lambda = self.lambda_scheduler.get_base_lambda(self.global_step)
+                if self.log:
+                    wandb.log({"train/lcn_lambda": self.lcn_lambda, "global_step": self.global_step}, commit=False)
+
             loss = []
             entropy = []
             for _ in range(num_model_updates):
@@ -691,8 +777,16 @@ class LCNTNDP(MOAgent, MOPolicy):
 
             if self.global_step >= (n_checkpoints + 1) * total_timesteps / 100:
                 self.save(savedir=save_dir, filename=f"LCN_model_{n_checkpoints}")
-                e_returns, returns, _, e_states = self.evaluate(eval_env, max_return, n=num_points_pf, starting_loc=starting_loc)
+                e_returns, returns, _, e_states, e_cell_satisfaction = self.evaluate(eval_env, max_return, n=num_points_pf, starting_loc=starting_loc)
                 if self.log:
+                    city = eval_env.unwrapped.city if hasattr(eval_env.unwrapped, 'city') else None
+                    cell_sat = np.array(e_cell_satisfaction) if e_cell_satisfaction else None
+                    cell_dem = None
+                    agg_od = None
+                    if city is not None and cell_sat is not None and len(cell_sat) > 0:
+                        cell_dem = np.sum(city.od_mx, axis=1) + np.sum(city.od_mx, axis=0)
+                        agg_od = city.agg_od_mx().flatten()
+
                     log_all_multi_policy_metrics(
                         current_front=e_returns,
                         hv_ref_point=ref_point,
@@ -700,6 +794,9 @@ class LCNTNDP(MOAgent, MOPolicy):
                         global_step=self.global_step,
                         n_sample_weights=num_eval_weights_for_eval,
                         ref_front=known_pareto_front,
+                        cell_satisfaction_rates=cell_sat,
+                        cell_demands=cell_dem,
+                        agg_od_by_cell=agg_od,
                     )
 
                     # Offline logger
