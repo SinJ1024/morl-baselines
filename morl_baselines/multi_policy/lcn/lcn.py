@@ -220,7 +220,7 @@ class LCNTNDP(MOAgent, MOPolicy):
             "continuous_action": self.continuous_action,
             "noise": self.noise,
             "seed": self.seed,
-        }
+    }
 
     def update(self):
         """Update LCN model."""
@@ -596,7 +596,7 @@ class LCNTNDP(MOAgent, MOPolicy):
                     "lcn_lambda": self.lcn_lambda,
                     "cd_threshold": cd_threshold,
                 }
-            ) 
+            )
         self.global_step = 0
         total_episodes = num_er_episodes
         n_checkpoints = 0
