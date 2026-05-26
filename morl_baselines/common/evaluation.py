@@ -16,7 +16,9 @@ from morl_baselines.common.performance_indicators import (
     gini,
     hypervolume,
     igd,
+    max_min_satisfaction_floor,
     maximum_utility_loss,
+    spatial_sen_welfare,
 )
 from morl_baselines.common.weights import equally_spaced_weights
 
@@ -179,6 +181,9 @@ def log_all_multi_policy_metrics(
     global_step: int,
     n_sample_weights: int,
     ref_front: Optional[List[np.ndarray]] = None,
+    cell_satisfaction_rates: Optional[np.ndarray] = None,
+    cell_demands: Optional[np.ndarray] = None,
+    agg_od_by_cell: Optional[np.ndarray] = None,
 ):
     """Logs all metrics for multi-policy training.
 
@@ -188,6 +193,9 @@ def log_all_multi_policy_metrics(
     If a reference front is provided, also logs:
     - Inverted generational distance (IGD)
     - Maximum utility loss (MUL)
+    If cell-level data is provided, also logs:
+    - Max-Min Satisfaction Floor (Rawlsian fairness)
+    - Spatial Sen Welfare (high/low demand regions)
 
     Args:
         current_front (List) : current Pareto front approximation, computed in an evaluation step
@@ -196,6 +204,9 @@ def log_all_multi_policy_metrics(
         global_step: global step for logging
         n_sample_weights: number of weights to sample for EUM and MUL computation
         ref_front: reference front, if known
+        cell_satisfaction_rates: shape (n_lines, grid_size) — per-cell satisfaction per line
+        cell_demands: shape (grid_size,) — per-cell total demand
+        agg_od_by_cell: shape (grid_size,) — aggregated OD demand per cell
     """
     filtered_front = list(filter_pareto_dominated(current_front))
     hv = hypervolume(hv_ref_point, filtered_front)
@@ -206,23 +217,34 @@ def log_all_multi_policy_metrics(
     nash_welfare = np.prod(filtered_front, axis=1)
     sen_welfare = utils_sum * (1 - gi)
 
-    wandb.log(
-        {
-            "eval/hypervolume": hv,
-            "eval/eum": eum,
-            "eval/cardinality": card,
-            "global_step": global_step,
-            "eval/gini_median": np.median(gi),
-            "eval/gini_min": np.min(gi),
-            "eval/efficiency_median": np.median(utils_sum),
-            "eval/efficiency_max": np.max(utils_sum),
-            "eval/sen_welfare_median": np.median(sen_welfare),
-            "eval/sen_welfare_max": np.max(sen_welfare),
-            "eval/nash_welfare_median": np.median(nash_welfare),
-            "eval/nash_welfare_max": np.max(nash_welfare)
-        },
-        commit=False,
-    )
+    metrics = {
+        "eval/hypervolume": hv,
+        "eval/eum": eum,
+        "eval/cardinality": card,
+        "global_step": global_step,
+        "eval/gini_median": np.median(gi),
+        "eval/gini_min": np.min(gi),
+        "eval/efficiency_median": np.median(utils_sum),
+        "eval/efficiency_max": np.max(utils_sum),
+        "eval/sen_welfare_median": np.median(sen_welfare),
+        "eval/sen_welfare_max": np.max(sen_welfare),
+        "eval/nash_welfare_median": np.median(nash_welfare),
+        "eval/nash_welfare_max": np.max(nash_welfare),
+    }
+
+    if cell_satisfaction_rates is not None and cell_demands is not None:
+        floor_vals = max_min_satisfaction_floor(cell_satisfaction_rates, cell_demands)
+        metrics["eval/maxmin_floor_median"] = np.median(floor_vals)
+        metrics["eval/maxmin_floor_max"] = np.max(floor_vals)
+
+        if agg_od_by_cell is not None:
+            sw_high, sw_low = spatial_sen_welfare(cell_satisfaction_rates, cell_demands, agg_od_by_cell)
+            metrics["eval/spatial_sw_high_median"] = np.median(sw_high)
+            metrics["eval/spatial_sw_low_median"] = np.median(sw_low)
+            sw_high_med = np.median(sw_high)
+            metrics["eval/spatial_sw_ratio"] = np.median(sw_low) / (sw_high_med + 1e-8)
+
+    wandb.log(metrics, commit=False)
     front = wandb.Table(
         columns=[f"objective_{i}" for i in range(1, reward_dim + 1)],
         data=[p.tolist() for p in filtered_front],

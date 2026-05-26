@@ -145,3 +145,61 @@ def gini(x, normalized=True):
     if normalized:
         gi = gi * (n / (n - 1))
     return gi
+
+
+def max_min_satisfaction_floor(cell_satisfaction_rates: np.ndarray, cell_demands: np.ndarray) -> np.ndarray:
+    """Rawlsian Max-Min Satisfaction Floor: min satisfaction rate across cells with nonzero demand.
+
+    Args:
+        cell_satisfaction_rates: shape (n_lines, grid_size) — per-cell satisfaction per evaluated line.
+        cell_demands: shape (grid_size,) — per-cell total demand.
+
+    Returns:
+        np.ndarray: shape (n_lines,) — floor metric for each evaluated line.
+    """
+    has_demand = cell_demands > 0
+    if not np.any(has_demand):
+        return np.zeros(cell_satisfaction_rates.shape[0])
+    return np.min(cell_satisfaction_rates[:, has_demand], axis=1)
+
+
+def spatial_sen_welfare(
+    cell_satisfaction_rates: np.ndarray,
+    cell_demands: np.ndarray,
+    agg_od_by_cell: np.ndarray,
+) -> tuple:
+    """Spatial Sen Welfare: split cells into high/low demand regions, compute SW per region.
+
+    SW_k = E_k * (1 - G_k) where E_k = sum of satisfied demand, G_k = Gini of satisfaction rates.
+
+    Args:
+        cell_satisfaction_rates: shape (n_lines, grid_size).
+        cell_demands: shape (grid_size,).
+        agg_od_by_cell: shape (grid_size,) — aggregated OD demand per cell for region splitting.
+
+    Returns:
+        (sw_high, sw_low): each shape (n_lines,).
+    """
+    has_demand = cell_demands > 0
+    if not np.any(has_demand):
+        n = cell_satisfaction_rates.shape[0]
+        return np.zeros(n), np.zeros(n)
+
+    threshold = np.median(agg_od_by_cell[has_demand])
+    high_mask = has_demand & (agg_od_by_cell >= threshold)
+    low_mask = has_demand & (agg_od_by_cell < threshold)
+
+    def _region_welfare(mask):
+        n_lines = cell_satisfaction_rates.shape[0]
+        n_cells = np.sum(mask)
+        if n_cells < 2:
+            satisfied = np.sum(cell_satisfaction_rates[:, mask] * cell_demands[mask], axis=1)
+            return satisfied
+
+        region_sr = cell_satisfaction_rates[:, mask]
+        satisfied = np.sum(region_sr * cell_demands[mask], axis=1)
+        gi = gini(region_sr, normalized=True)
+        gi = np.clip(gi, 0.0, 1.0)
+        return satisfied * (1 - gi)
+
+    return _region_welfare(high_mask), _region_welfare(low_mask)
