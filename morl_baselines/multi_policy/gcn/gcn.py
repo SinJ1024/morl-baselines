@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import wandb
 
 from morl_baselines.common.evaluation import log_all_multi_policy_metrics
-from morl_baselines.multi_policy.gcn.hyperparam_scheduling import HyperparamScheduler
+from morl_baselines.multi_policy.gcn.hyperparam_scheduler import HyperparamScheduler
 from morl_baselines.multi_policy.gcn.gcn_model_classes import BaseGCNModel, DefaultGCNModel
 from morl_baselines.multi_policy.gcn.helpers import crowding_distance
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
@@ -64,8 +64,6 @@ class GCN(MOAgent, MOPolicy):
             nr_layers (int, optional): Number of NN Linear layers. Defaults to 1.
             hidden_dim (int, optional): Hidden dimension. Defaults to 64.
             noise (float, optional): Standard deviation of the noise to add to the action in the continuous action case. Defaults to 0.1.
-            distance_ref (str, optional): Reference point for distance computation. Defaults to 'nondominated', other option is 'optimal'.
-            lcn_lambda (float, optional): Lambda parameter for the GCN model-Controls the size of the solution set to explore. Defaults to None.
             project_name (str, optional): Name of the project for wandb. Defaults to "MORL-Baselines".
             experiment_name (str, optional): Name of the experiment for wandb. Defaults to "GCN".
             wandb_entity (Optional[str], optional): Entity for wandb. Defaults to None.
@@ -76,6 +74,7 @@ class GCN(MOAgent, MOPolicy):
             dominance_func (Callable, optional): Function that provides a fairness ranking between strategies.
             l2_func (Callable, optional): Function that provides the distances for crowding calculation
             l2_params (Dict, optional): Paramaters for l2_func
+            hyperparam_scheduler (HyperparamScheduler): A scheduler that may edit the model's hyperparameters during training. Currently only used for LCN's lambda
         """
         MOAgent.__init__(self, env, device=device, seed=seed)
         MOPolicy.__init__(self, device)
@@ -86,7 +85,6 @@ class GCN(MOAgent, MOPolicy):
         self.learning_rate = learning_rate
         self.nr_layers = nr_layers
         self.hidden_dim = hidden_dim
-        self.distance_ref = distance_ref
         self.scaling_factor = scaling_factor
         self.desired_return = None
         self.desired_horizon = None
@@ -151,7 +149,7 @@ class GCN(MOAgent, MOPolicy):
             th.tensor(desired_return).to(self.device),
             th.tensor(desired_horizon).unsqueeze(1).to(self.device),
         )
-        prediction = th.nn.functional.log_softmax(probs, dim=-1)
+        prediction = nn.functional.log_softmax(probs, dim=-1)
 
         self.opt.zero_grad()
         # one-hot of action for CE loss
@@ -176,23 +174,7 @@ class GCN(MOAgent, MOPolicy):
         else:
             heapq.heappush(self.experience_replay, (1, step, transitions))
 
-    def _compute_route_contexts(self):
-        """Compute normalized demand context for each episode in the ER buffer.
-
-        Returns: array of shape (len(experience_replay),) with values in [0, 1].
-        """
-        if self.demand_context is None:
-            return np.zeros(len(self.experience_replay))
-        contexts = []
-        for ep in self.experience_replay:
-            transitions = ep[2]
-            cell_indices = [t.cell_index for t in transitions if t.cell_index >= 0]
-            if cell_indices:
-                contexts.append(np.mean(self.demand_context[cell_indices]))
-            else:
-                contexts.append(0.0)
-        return np.array(contexts)
-
+    
     def _nlargest(self, n):
         returns = np.array([e[2][0].reward for e in self.experience_replay])
         # crowding distance of each point, check ones that are too close together
@@ -244,7 +226,7 @@ class GCN(MOAgent, MOPolicy):
         probs = probs.detach()
 
         # Apply the mask before log_softmax -- we add a large large number to the unmasked actions (Linear can return negative values)
-        prediction = th.nn.functional.log_softmax(probs.cpu() + action_mask * 10000, dim=-1)
+        prediction = nn.functional.log_softmax(probs.cpu() + action_mask * 10000, dim=-1)
  
         log_probs = prediction.detach().cpu().numpy()[0]
 
@@ -386,20 +368,14 @@ class GCN(MOAgent, MOPolicy):
                     "num_policies": n_policies,
                     "save_dir": save_dir,
                     "nr_stations": nr_stations,
-                    "distance_ref": self.distance_ref,
                     "cd_threshold": cd_threshold,
-                    #!TODO: How do we take note of scheduling???
                 }
             )
-            if self.hyperparam_scheduler is not None and self.hyperparam_scheduler.target_key == 'lcn_lambda':
-                self.register_additional_config({
-                    "lambda_schedule": self.hyperparam_scheduler.schedule_type,
-                    "lambda_start": self.hyperparam_scheduler.start_val,
-                    "lambda_end": self.hyperparam_scheduler.end_val,
-                    "lambda_warmup_fraction": self.hyperparam_scheduler.warmup_fraction,
-                    "lambda_freeze_fraction": self.hyperparam_scheduler.freeze_fraction,
-                    "spatial_alpha": self.spatial_alpha,
-                })
+            if self.hyperparam_scheduler is not None:
+                self.register_additional_config(
+                    self.hyperparam_scheduler.get_config()
+                    #"spatial_alpha": self.l2_params['spatial_alpha']
+                )
         self.global_step = 0
 
         if self.hyperparam_scheduler is not None:
@@ -408,7 +384,7 @@ class GCN(MOAgent, MOPolicy):
         if hasattr(self.env.unwrapped, 'city'):
             agg_od = self.env.unwrapped.city.agg_od_mx().flatten()
             max_od = agg_od.max()
-            self.demand_context = agg_od / max_od if max_od > 0 else agg_od
+            self.l2_params['demand_context'] = agg_od / max_od if max_od > 0 else agg_od
         total_episodes = num_er_episodes
         n_checkpoints = 0
         self.cd_threshold = cd_threshold
@@ -433,9 +409,10 @@ class GCN(MOAgent, MOPolicy):
         returns = None
         while self.global_step < total_timesteps:
             if self.hyperparam_scheduler is not None:
-                self.hyperparam_scheduler.step(global_step, self.l2_params)
+                self.hyperparam_scheduler.step(self.global_step, self.l2_params)
                 if self.log:
-                    wandb.log({"train/lcn_lambda": self.l2_params['lcn_lambda'], "global_step": self.global_step}, commit=False)
+                    key = self.hyperparam_scheduler.target_key
+                    wandb.log({f"train/{key}": self.l2_params[key], "global_step": self.global_step}, commit=False)
 
             loss = []
             entropy = []

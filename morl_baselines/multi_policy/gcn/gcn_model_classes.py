@@ -6,7 +6,7 @@ import numpy as np
 class BaseGCNModel(nn.Module, ABC):
     """Base Model for the GCN."""
 
-    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int, nr_layers: int = 1):
+    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int):
         """Initialize the GCN model."""
         super().__init__()
         self.state_dim = state_dim

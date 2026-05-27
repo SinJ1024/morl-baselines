@@ -47,19 +47,19 @@ class HyperparamScheduler:
         self._freeze_start = int(total_timesteps * (1 - freeze_fraction))
         self._active_duration = max(self._freeze_start - self._warmup_end, 1)
 
-    def step(self, current_step: int, params) -> float:
+    def step(self, current_step: int, params):
         """Return the base lambda value at the given training step."""
         if current_step <= self._warmup_end:
             params[self.target_key] = self.start_val
+            return
         if current_step >= self._freeze_start:
             params[self.target_key] = self.end_val
+            return
 
         progress = (current_step - self._warmup_end) / self._active_duration
-        progress = max(0.0, min(1.0, progress))
 
         if self.schedule_type == 'linear':
             params[self.target_key] = self.start_val + (self.end_val - self.start_val) * progress
-            return
         elif self.schedule_type == 'cosine':
             params[self.target_key] = self.end_val + 0.5 * (self.start_val - self.end_val) * (1 + math.cos(math.pi * progress))
         elif self.schedule_type == 'step':
