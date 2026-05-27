@@ -1,6 +1,5 @@
 import heapq
 import os
-from abc import ABC
 from dataclasses import dataclass
 from typing import List, Optional, Type, Union, Dict, Callable
 
@@ -12,56 +11,11 @@ import torch.nn.functional as F
 import wandb
 
 from morl_baselines.common.evaluation import log_all_multi_policy_metrics
-from morl_baselines.multi_policy.lcn.lambda_scheduler import LambdaScheduler
+from morl_baselines.multi_policy.gcn.hyperparam_scheduling import HyperparamScheduler
+from morl_baselines.multi_policy.gcn.gcn_model_classes import BaseGCNModel, DefaultGCNModel
+from morl_baselines.multi_policy.gcn.helpers import crowding_distance
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
 from morl_baselines.common.performance_indicators import hypervolume
-
-import json
-from matplotlib import pyplot as plt
-from morl_baselines.multi_policy.pcn.pcn import BasePCNModel, ContinuousActionsDefaultModel, DiscreteActionsDefaultModel
-
-
-def crowding_distance(points):
-    """Compute the crowding distance of a set of points."""
-    # first normalize across dimensions
-    points = (points - points.min(axis=0)) / (points.ptp(axis=0) + 1e-8)
-    # sort points per dimension
-    dim_sorted = np.argsort(points, axis=0)
-    point_sorted = np.take_along_axis(points, dim_sorted, axis=0)
-    # compute distances between lower and higher point
-    distances = np.abs(point_sorted[:-2] - point_sorted[2:])
-    # pad extrema's with 1, for each dimension
-    distances = np.pad(distances, ((1,), (0,)), constant_values=1)
-    # sum distances of each dimension of the same point
-    crowding = np.zeros(points.shape)
-    crowding[dim_sorted, np.arange(points.shape[-1])] = distances
-    crowding = np.sum(crowding, axis=-1)
-    return crowding
-
-def gen_line_plot_grid(line, grid_x_size, grid_y_size):
-    """Generates a grid_x_max * grid_y_max grid where each grid is valued by the frequency it appears in the generated lines.
-    Essentially creates a grid of the given line to plot later on.
-
-    Args:
-        line (list): list of generated lines of the model
-        grid_x_max (int): nr of lines in the grid
-        grid_y_mask (int): nr of columns in the grid
-    """
-    data = np.zeros((grid_x_size, grid_y_size))
-
-    for station in line:
-        data[station[0], station[1]] += 1
- 
-    return data
-
-def highlight_cells(cells, ax, **kwargs):
-    """Highlights a cell in a grid plot. https://stackoverflow.com/questions/56654952/how-to-mark-cells-in-matplotlib-pyplot-imshow-drawing-cell-borders
-    """
-    for cell in cells:
-        (y, x) = cell
-        rect = plt.Rectangle((x-.5, y-.5), 1,1, fill=False, **kwargs)
-        ax.add_patch(rect)
-    return rect
 
 @dataclass
 class Transition:
@@ -75,64 +29,6 @@ class Transition:
     terminal: bool
     cell_index: int = -1
 
-
-class BaseGCNModel(nn.Module, ABC):
-    """Base Model for the GCN."""
-
-    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int, nr_layers: int = 1):
-        """Initialize the GCN model."""
-        super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.reward_dim = reward_dim
-        self.scaling_factor = nn.Parameter(th.tensor(scaling_factor).float(), requires_grad=False)
-        self.hidden_dim = hidden_dim
-        self.nr_layers = nr_layers
-
-        self.s_emb = nn.Sequential(nn.Linear(self.state_dim, self.hidden_dim), nn.Sigmoid())
-        self.c_emb = nn.Sequential(nn.Linear(self.reward_dim + 1, self.hidden_dim), nn.Sigmoid())
-
-        self.fc = nn.Sequential(
-            *[
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.ReLU(),
-            ] * self.nr_layers,
-            nn.Linear(self.hidden_dim, self.action_dim),
-        )
-
-    def forward(self, state, desired_return, desired_horizon):
-        """Return log-probabilities of actions or return action directly in case of continuous action space."""
-        c = th.cat((desired_return, desired_horizon), dim=-1)
-        # commands are scaled by a fixed factor
-        c = c * self.scaling_factor
-        s = self.s_emb(state.float())
-        c = self.c_emb(c)
-        # element-wise multiplication of state-embedding and command
-        prediction = self.fc(s * c)
-        return prediction
-
-class DefaultGCNModel(BaseGCNModel):
-    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int, nr_layers: int = 1):
-        """Initialize the GCN model."""
-        super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.reward_dim = reward_dim
-        self.scaling_factor = nn.Parameter(th.tensor(scaling_factor).float(), requires_grad=False)
-        self.hidden_dim = hidden_dim
-        self.nr_layers = nr_layers
-
-        self.s_emb = nn.Sequential(nn.Linear(self.state_dim, self.hidden_dim), nn.Sigmoid())
-        self.c_emb = nn.Sequential(nn.Linear(self.reward_dim + 1, self.hidden_dim), nn.Sigmoid())
-
-        self.fc = nn.Sequential(
-            *[
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.ReLU(),
-            ] * self.nr_layers,
-            nn.Linear(self.hidden_dim, self.action_dim),
-        )
-
 class GCN(MOAgent, MOPolicy):
 
     def __init__(
@@ -145,14 +41,6 @@ class GCN(MOAgent, MOPolicy):
         nr_layers: int = 1,
         hidden_dim: int = 64,
         noise: float = 0.1,
-        distance_ref: str = 'nondominated',
-        lcn_lambda: float = None,
-        lambda_schedule: str = 'constant',
-        lambda_start: float = 1.0,
-        lambda_end: float = None,
-        lambda_warmup_fraction: float = 0.0,
-        lambda_freeze_fraction: float = 0.1,
-        spatial_alpha: float = 0.0,
         project_name: str = "MORL-Baselines",
         experiment_name: str = "GCN",
         wandb_entity: Optional[str] = None,
@@ -162,7 +50,8 @@ class GCN(MOAgent, MOPolicy):
         model_class: Optional[Type[BaseGCNModel]] = None,
         dominance_func: Optional[Callable] = None,
         l2_func: Optional[Callable] = None,
-        l2_params: Optional[Dict] = None
+        l2_params: Optional[Dict] = None,
+        hyperparam_scheduler: HyperparamScheduler = None
     ) -> None:
         """Initialize GCN agent.
 
@@ -176,7 +65,7 @@ class GCN(MOAgent, MOPolicy):
             hidden_dim (int, optional): Hidden dimension. Defaults to 64.
             noise (float, optional): Standard deviation of the noise to add to the action in the continuous action case. Defaults to 0.1.
             distance_ref (str, optional): Reference point for distance computation. Defaults to 'nondominated', other option is 'optimal'.
-            lcn_lambda (float, optional): Lambda parameter for the LCN model-Controls the size of the solution set to explore. Defaults to None.
+            lcn_lambda (float, optional): Lambda parameter for the GCN model-Controls the size of the solution set to explore. Defaults to None.
             project_name (str, optional): Name of the project for wandb. Defaults to "MORL-Baselines".
             experiment_name (str, optional): Name of the experiment for wandb. Defaults to "GCN".
             wandb_entity (Optional[str], optional): Entity for wandb. Defaults to None.
@@ -198,31 +87,22 @@ class GCN(MOAgent, MOPolicy):
         self.nr_layers = nr_layers
         self.hidden_dim = hidden_dim
         self.distance_ref = distance_ref
-        self.lcn_lambda = lcn_lambda
-        self.lambda_schedule = lambda_schedule
-        self.lambda_start = lambda_start
-        self.lambda_end = lambda_end if lambda_end is not None else lcn_lambda
-        self.lambda_warmup_fraction = lambda_warmup_fraction
-        self.lambda_freeze_fraction = lambda_freeze_fraction
-        self.spatial_alpha = spatial_alpha
-        self.demand_context = None
-        self.lambda_scheduler = None
         self.scaling_factor = scaling_factor
         self.desired_return = None
         self.desired_horizon = None
-        self.continuous_action = True if type(self.env.action_space) is gym.spaces.Box else False
         self.noise = noise
 
         assert dominance_func is not None, "No fairness function defined for GCN cannot initialize model"
         self.dominance_func = dominance_func
         self.l2_func = l2_func
         self.l2_params = l2_params
+        self.hyperparam_scheduler = hyperparam_scheduler
  
         if model_class and not issubclass(model_class, BaseGCNModel):
             raise ValueError("model_class must be a subclass of BaseGCNModel")
 
         if model_class is None:
-            model_class = BaseGCNModel
+            model_class = DefaultGCNModel
 
         self.model = model_class(
             self.observation_dim, self.action_dim, self.reward_dim, self.scaling_factor, hidden_dim=self.hidden_dim, nr_layers=self.nr_layers
@@ -231,7 +111,6 @@ class GCN(MOAgent, MOPolicy):
 
         self.log = log
         if log:
-            experiment_name += " continuous action" if self.continuous_action else ""
             self.setup_wandb(project_name, experiment_name, wandb_entity)
 
     def get_config(self) -> dict:
@@ -245,7 +124,6 @@ class GCN(MOAgent, MOPolicy):
             "hidden_dim": self.hidden_dim,
             "nr_layers": self.nr_layers,
             "scaling_factor": self.scaling_factor,
-            "continuous_action": self.continuous_action,
             "noise": self.noise,
             "seed": self.seed,
     }
@@ -276,14 +154,11 @@ class GCN(MOAgent, MOPolicy):
         prediction = th.nn.functional.log_softmax(probs, dim=-1)
 
         self.opt.zero_grad()
-        if self.continuous_action:
-            l = F.mse_loss(th.tensor(actions).float().to(self.device), prediction)
-        else:
-            # one-hot of action for CE loss
-            actions = F.one_hot(th.tensor(actions).long().to(self.device), len(prediction[0]))
-            # cross-entropy loss
-            l = th.sum(-actions * prediction, -1)
-            l = l.mean()
+        # one-hot of action for CE loss
+        actions = F.one_hot(th.tensor(actions).long().to(self.device), len(prediction[0]))
+        # cross-entropy loss
+        l = th.sum(-actions * prediction, -1)
+        l = l.mean()
         l.backward()
         self.opt.step()
 
@@ -371,20 +246,13 @@ class GCN(MOAgent, MOPolicy):
         # Apply the mask before log_softmax -- we add a large large number to the unmasked actions (Linear can return negative values)
         prediction = th.nn.functional.log_softmax(probs.cpu() + action_mask * 10000, dim=-1)
  
-        if self.continuous_action:
-            action = prediction.detach().cpu().numpy()[0]
-            if not eval_mode:
-                # Add Gaussian noise: https://arxiv.org/pdf/2204.05027.pdf
-                action = action + np.random.normal(0.0, self.noise)
-            return action
-        else:
-            log_probs = prediction.detach().cpu().numpy()[0]
+        log_probs = prediction.detach().cpu().numpy()[0]
 
-            if eval_mode:
-                action = np.argmax(log_probs)
-            else:
-                action = self.np_random.choice(np.arange(len(log_probs)), p=np.exp(log_probs))
-            return action
+        if eval_mode:
+            action = np.argmax(log_probs)
+        else:
+            action = self.np_random.choice(np.arange(len(log_probs)), p=np.exp(log_probs))
+        return action
 
     def _run_episode(self, env, desired_return, desired_horizon, max_return, starting_loc=None, eval_mode=False):
         transitions = []
@@ -519,28 +387,23 @@ class GCN(MOAgent, MOPolicy):
                     "save_dir": save_dir,
                     "nr_stations": nr_stations,
                     "distance_ref": self.distance_ref,
-                    "lcn_lambda": self.lcn_lambda,
                     "cd_threshold": cd_threshold,
-                    "lambda_schedule": self.lambda_schedule,
-                    "lambda_start": self.lambda_start,
-                    "lambda_end": self.lambda_end,
-                    "lambda_warmup_fraction": self.lambda_warmup_fraction,
-                    "lambda_freeze_fraction": self.lambda_freeze_fraction,
-                    "spatial_alpha": self.spatial_alpha,
+                    #!TODO: How do we take note of scheduling???
                 }
             )
+            if self.hyperparam_scheduler is not None and self.hyperparam_scheduler.target_key == 'lcn_lambda':
+                self.register_additional_config({
+                    "lambda_schedule": self.hyperparam_scheduler.schedule_type,
+                    "lambda_start": self.hyperparam_scheduler.start_val,
+                    "lambda_end": self.hyperparam_scheduler.end_val,
+                    "lambda_warmup_fraction": self.hyperparam_scheduler.warmup_fraction,
+                    "lambda_freeze_fraction": self.hyperparam_scheduler.freeze_fraction,
+                    "spatial_alpha": self.spatial_alpha,
+                })
         self.global_step = 0
 
-        if self.lambda_schedule != 'constant' and self.lcn_lambda is not None:
-            self.lambda_scheduler = LambdaScheduler(
-                schedule_type=self.lambda_schedule,
-                lambda_start=self.lambda_start,
-                lambda_end=self.lambda_end,
-                total_timesteps=total_timesteps,
-                warmup_fraction=self.lambda_warmup_fraction,
-                freeze_fraction=self.lambda_freeze_fraction,
-            )
-            self.lcn_lambda = self.lambda_start
+        if self.hyperparam_scheduler is not None:
+            self.hyperparam_scheduler.step(0, self.l2_params)
 
         if hasattr(self.env.unwrapped, 'city'):
             agg_od = self.env.unwrapped.city.agg_od_mx().flatten()
@@ -569,20 +432,19 @@ class GCN(MOAgent, MOPolicy):
 
         returns = None
         while self.global_step < total_timesteps:
-            if self.lambda_scheduler is not None:
-                self.lcn_lambda = self.lambda_scheduler.get_base_lambda(self.global_step)
+            if self.hyperparam_scheduler is not None:
+                self.hyperparam_scheduler.step(global_step, self.l2_params)
                 if self.log:
-                    wandb.log({"train/lcn_lambda": self.lcn_lambda, "global_step": self.global_step}, commit=False)
+                    wandb.log({"train/lcn_lambda": self.l2_params['lcn_lambda'], "global_step": self.global_step}, commit=False)
 
             loss = []
             entropy = []
             for _ in range(num_model_updates):
                 l, lp = self.update()
                 loss.append(l.detach().cpu().numpy())
-                if not self.continuous_action:
-                    lp = lp.detach().cpu().numpy()
-                    ent = np.sum(-np.exp(lp) * lp)
-                    entropy.append(ent)
+                lp = lp.detach().cpu().numpy()
+                ent = np.sum(-np.exp(lp) * lp)
+                entropy.append(ent)
 
             desired_return, desired_horizon = self._choose_commands(num_er_episodes)
 
@@ -598,15 +460,9 @@ class GCN(MOAgent, MOPolicy):
                         "train/hypervolume": hv_est,
                         "train/loss": np.mean(loss),
                         "global_step": self.global_step,
+                        "train/entropy": np.mean(entropy),
                     },
                 )
-                if not self.continuous_action:
-                    wandb.log(
-                        {
-                            "train/entropy": np.mean(entropy),
-                            "global_step": self.global_step,
-                        },
-                    )
 
             returns = []
             horizons = []
@@ -644,7 +500,7 @@ class GCN(MOAgent, MOPolicy):
             )
 
             if self.global_step >= (n_checkpoints + 1) * total_timesteps / 1000:
-                self.save(savedir=save_dir, filename=f"LCN_model_{n_checkpoints}")
+                self.save(savedir=save_dir, filename=f"GCN_model_{n_checkpoints}")
                 n_checkpoints += 1
                 e_returns, returns, _, e_states, e_cell_satisfaction = self.evaluate(eval_env, max_return, n=num_points_pf, starting_loc=starting_loc)
 

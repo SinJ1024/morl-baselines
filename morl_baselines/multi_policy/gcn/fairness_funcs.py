@@ -62,6 +62,8 @@ def pareto_l2( returns, sma, params ):
 def lorenz_l2( returns, sma, params ):
     distance_ref = params['distance_ref']
     lcn_lambda = params['lcn_lambda']
+    spatial_alpha = params['spatial_alpha']
+    demand_context = params['demand_context']
 
     if distance_ref == 'nondominated':
         lv = lorenz_vector(np.array(returns))
@@ -100,6 +102,13 @@ def lorenz_l2( returns, sma, params ):
         # Filter out the ND points whose gini is > lamda (or the min gini)
         non_dominated_i = ginis <= lcn_lambda
         # If no solution is left after filtering, take the ones with the lowest gini
+        if spatial_alpha > 0 and demand_context is not None:
+            route_contexts = self._compute_route_contexts()
+            nd_contexts = route_contexts[np.nonzero(get_non_dominated_inds(returns))[0]]
+            effective_lambdas_nd = np.maximum(lcn_lambda, spatial_alpha * nd_contexts)
+            non_dominated_i = ginis <= effective_lambdas_nd
+        else:
+            non_dominated_i = ginis <= lcn_lambda
         if sum(non_dominated_i) == 0:
             threshold = np.min(ginis)
             non_dominated_i = ginis <= threshold
@@ -126,6 +135,13 @@ def lorenz_l2( returns, sma, params ):
         # The final vector is a weighted average of the lorenz vector and the full returns
         fv = lcn_lambda * returns + (1 - lcn_lambda) * lv
 
+        if spatial_alpha > 0 and demand_context is not None:
+            route_contexts = self._compute_route_contexts()
+            effective_lambdas = np.maximum(lcn_lambda, spatial_alpha * route_contexts)
+            fv = effective_lambdas[:, np.newaxis] * returns + (1 - effective_lambdas[:, np.newaxis]) * lv
+        else:
+            fv = lcn_lambda * returns + (1 - lcn_lambda) * lv
+
         non_dominated_i, non_dominated = get_non_pareto_dominated(lv)
 
         # we will compute distance of each point with each non-dominated point,
@@ -150,7 +166,12 @@ def lorenz_l2( returns, sma, params ):
 
         lv = lorenz_vector(np.array(returns))
         # The final vector is a weighted average of the lorenz vector and the full returns
-        fv = lcn_lambda * returns + (1 - lcn_lambda) * lv
+        if spatial_alpha > 0 and demand_context is not None:
+            route_contexts = self._compute_route_contexts()
+            effective_lambdas = np.maximum(lcn_lambda, spatial_alpha * route_contexts)
+            fv = effective_lambdas[:, np.newaxis] * returns + (1 - effective_lambdas[:, np.newaxis]) * lv
+        else:
+            fv = lcn_lambda * returns + (1 - lcn_lambda) * lv
 
         non_dominated_i, non_dominated = get_non_pareto_dominated(lv)
 
