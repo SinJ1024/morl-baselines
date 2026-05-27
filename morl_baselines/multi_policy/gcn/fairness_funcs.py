@@ -5,7 +5,7 @@ from morl_baselines.common.performance_indicators import gini
 # Dominance Functions
 ######################################################################
 
-def get_non_pareto_dominated(solutions: np.ndarray):
+def get_non_pareto_dominated(solutions: np.ndarray, params):
     is_efficient = np.ones(solutions.shape[0], dtype=bool)
     for i, c in enumerate(solutions):
         if is_efficient[i]:
@@ -16,10 +16,40 @@ def get_non_pareto_dominated(solutions: np.ndarray):
 
     return is_efficient, solutions[is_efficient]
 
-def get_nash_score(solutions: np.ndarray):
-    scores = solutions.prod(axis=1)
-    scores_i = scores.argsort()
-    return scores_i, scores[scores_i]
+def get_nash_score(solutions: np.ndarray, shift=0.0, epsilon=1e-10):
+    shifted = solutions + shift
+    return np.mean(np.log(np.maximum(shifted, epsilon)), axis=1)
+
+def get_nash_dominated(solution: np.ndarray, params):
+    """
+    """
+    params = params or {}
+    mode = params.get('mode', 'pareto_filter')
+    shift = params.get('shift', 0.0)
+    epsilon = params.get('epsilon', 1e-10)
+
+    scores = get_nash_score(solutions, shift=shift, epsilon=epsilon)
+    pareto_mask, _ = get_non_pareto_dominated(solutions)
+    pareto_size = int(pareto_mask.sum())
+
+    if mode == 'pareto_filter':
+        top_k = int(params.get('top_k', pareto_size))
+        top_k = max(1, min(top_k, pareto_size))
+        pf_indices = np.flatnonzero(pareto_mask)
+        pf_scores = scores[pareto_mask]
+        if top_k < len(pf_scores)
+            pf_top_k = np.argpartition(pf_scores, -top_k)[-top_k:]
+            pf_indices = pf_indices[pf_top_k]
+ 
+    elif mode == 'pareto_sized':
+        if pareto_size >= len(scores):
+            mask = np.ones(len(scores), type=bool)
+            return mask, solutions[mask]
+        best = np.argpartition(scores, -pareto_size)[-pareto_size:]
+
+    mask = np.zeros(len(solutions), dtype=bool)
+    mask[best] = True
+    return mask, solution[mask]
 
 ######################################################################
 # Utility Functions
@@ -179,7 +209,7 @@ def lorenz_l2( returns, sma, params ):
     return l2
 
 def nash_l2( returns, sma, params ):
-    scores_i, scores = get_nash_score(returns)
+    non_dominated_i, non_dominated = get_nash_dominated(returns)
 
     # we will compute distance of each point with each non-dominated point,
     # duplicate each point with number of non_dominated to compute respective distance
