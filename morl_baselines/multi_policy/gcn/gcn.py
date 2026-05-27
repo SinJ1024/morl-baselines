@@ -12,8 +12,14 @@ import torch.nn.functional as F
 import wandb
 
 from morl_baselines.common.evaluation import log_all_multi_policy_metrics
+from morl_baselines.multi_policy.lcn.lambda_scheduler import LambdaScheduler
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
 from morl_baselines.common.performance_indicators import hypervolume
+
+import json
+from matplotlib import pyplot as plt
+from morl_baselines.multi_policy.pcn.pcn import BasePCNModel, ContinuousActionsDefaultModel, DiscreteActionsDefaultModel
+
 
 def crowding_distance(points):
     """Compute the crowding distance of a set of points."""
@@ -32,6 +38,30 @@ def crowding_distance(points):
     crowding = np.sum(crowding, axis=-1)
     return crowding
 
+def gen_line_plot_grid(line, grid_x_size, grid_y_size):
+    """Generates a grid_x_max * grid_y_max grid where each grid is valued by the frequency it appears in the generated lines.
+    Essentially creates a grid of the given line to plot later on.
+
+    Args:
+        line (list): list of generated lines of the model
+        grid_x_max (int): nr of lines in the grid
+        grid_y_mask (int): nr of columns in the grid
+    """
+    data = np.zeros((grid_x_size, grid_y_size))
+
+    for station in line:
+        data[station[0], station[1]] += 1
+ 
+    return data
+
+def highlight_cells(cells, ax, **kwargs):
+    """Highlights a cell in a grid plot. https://stackoverflow.com/questions/56654952/how-to-mark-cells-in-matplotlib-pyplot-imshow-drawing-cell-borders
+    """
+    for cell in cells:
+        (y, x) = cell
+        rect = plt.Rectangle((x-.5, y-.5), 1,1, fill=False, **kwargs)
+        ax.add_patch(rect)
+    return rect
 
 @dataclass
 class Transition:
@@ -39,15 +69,17 @@ class Transition:
 
     observation: np.ndarray
     action: Union[float, int]
+    action_mask: np.ndarray
     reward: np.ndarray
     next_observation: np.ndarray
     terminal: bool
+    cell_index: int = -1
 
 
 class BaseGCNModel(nn.Module, ABC):
     """Base Model for the GCN."""
 
-    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int):
+    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int, nr_layers: int = 1):
         """Initialize the GCN model."""
         super().__init__()
         self.state_dim = state_dim
@@ -55,6 +87,18 @@ class BaseGCNModel(nn.Module, ABC):
         self.reward_dim = reward_dim
         self.scaling_factor = nn.Parameter(th.tensor(scaling_factor).float(), requires_grad=False)
         self.hidden_dim = hidden_dim
+        self.nr_layers = nr_layers
+
+        self.s_emb = nn.Sequential(nn.Linear(self.state_dim, self.hidden_dim), nn.Sigmoid())
+        self.c_emb = nn.Sequential(nn.Linear(self.reward_dim + 1, self.hidden_dim), nn.Sigmoid())
+
+        self.fc = nn.Sequential(
+            *[
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.ReLU(),
+            ] * self.nr_layers,
+            nn.Linear(self.hidden_dim, self.action_dim),
+        )
 
     def forward(self, state, desired_return, desired_horizon):
         """Return log-probabilities of actions or return action directly in case of continuous action space."""
@@ -67,37 +111,27 @@ class BaseGCNModel(nn.Module, ABC):
         prediction = self.fc(s * c)
         return prediction
 
+class DefaultGCNModel(BaseGCNModel):
+    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int, nr_layers: int = 1):
+        """Initialize the GCN model."""
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.reward_dim = reward_dim
+        self.scaling_factor = nn.Parameter(th.tensor(scaling_factor).float(), requires_grad=False)
+        self.hidden_dim = hidden_dim
+        self.nr_layers = nr_layers
 
-class DiscreteActionsGeneralModel(BaseGCNModel):
-    """Model for the GCN with discrete actions."""
-
-    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int):
-        """Initialize the GCN model for discrete actions."""
-        super().__init__(state_dim, action_dim, reward_dim, scaling_factor, hidden_dim)
         self.s_emb = nn.Sequential(nn.Linear(self.state_dim, self.hidden_dim), nn.Sigmoid())
         self.c_emb = nn.Sequential(nn.Linear(self.reward_dim + 1, self.hidden_dim), nn.Sigmoid())
+
         self.fc = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, self.action_dim),
-            nn.LogSoftmax(dim=1),
-        )
-
-
-class ContinuousActionsGeneralModel(BaseGCNModel):
-    """Model for the GCN with continuous actions."""
-
-    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int):
-        """Initialize the GCN model for continuous actions."""
-        super().__init__(state_dim, action_dim, reward_dim, scaling_factor, hidden_dim)
-        self.s_emb = nn.Sequential(nn.Linear(self.state_dim, self.hidden_dim), nn.Sigmoid())
-        self.c_emb = nn.Sequential(nn.Linear(self.reward_dim + 1, self.hidden_dim), nn.Sigmoid())
-        self.fc = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.ReLU(),
+            *[
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.ReLU(),
+            ] * self.nr_layers,
             nn.Linear(self.hidden_dim, self.action_dim),
         )
-
 
 class GCN(MOAgent, MOPolicy):
 
@@ -107,9 +141,18 @@ class GCN(MOAgent, MOPolicy):
         scaling_factor: np.ndarray,
         learning_rate: float = 1e-3,
         gamma: float = 1.0,
-        batch_size: int = 256,
+        batch_size: int = 32,
+        nr_layers: int = 1,
         hidden_dim: int = 64,
         noise: float = 0.1,
+        distance_ref: str = 'nondominated',
+        lcn_lambda: float = None,
+        lambda_schedule: str = 'constant',
+        lambda_start: float = 1.0,
+        lambda_end: float = None,
+        lambda_warmup_fraction: float = 0.0,
+        lambda_freeze_fraction: float = 0.1,
+        spatial_alpha: float = 0.0,
         project_name: str = "MORL-Baselines",
         experiment_name: str = "GCN",
         wandb_entity: Optional[str] = None,
@@ -129,8 +172,11 @@ class GCN(MOAgent, MOPolicy):
             learning_rate (float, optional): Learning rate. Defaults to 1e-2.
             gamma (float, optional): Discount factor. Defaults to 1.0.
             batch_size (int, optional): Batch size. Defaults to 32.
+            nr_layers (int, optional): Number of NN Linear layers. Defaults to 1.
             hidden_dim (int, optional): Hidden dimension. Defaults to 64.
             noise (float, optional): Standard deviation of the noise to add to the action in the continuous action case. Defaults to 0.1.
+            distance_ref (str, optional): Reference point for distance computation. Defaults to 'nondominated', other option is 'optimal'.
+            lcn_lambda (float, optional): Lambda parameter for the LCN model-Controls the size of the solution set to explore. Defaults to None.
             project_name (str, optional): Name of the project for wandb. Defaults to "MORL-Baselines".
             experiment_name (str, optional): Name of the experiment for wandb. Defaults to "GCN".
             wandb_entity (Optional[str], optional): Entity for wandb. Defaults to None.
@@ -149,7 +195,18 @@ class GCN(MOAgent, MOPolicy):
         self.batch_size = batch_size
         self.gamma = gamma
         self.learning_rate = learning_rate
+        self.nr_layers = nr_layers
         self.hidden_dim = hidden_dim
+        self.distance_ref = distance_ref
+        self.lcn_lambda = lcn_lambda
+        self.lambda_schedule = lambda_schedule
+        self.lambda_start = lambda_start
+        self.lambda_end = lambda_end if lambda_end is not None else lcn_lambda
+        self.lambda_warmup_fraction = lambda_warmup_fraction
+        self.lambda_freeze_fraction = lambda_freeze_fraction
+        self.spatial_alpha = spatial_alpha
+        self.demand_context = None
+        self.lambda_scheduler = None
         self.scaling_factor = scaling_factor
         self.desired_return = None
         self.desired_horizon = None
@@ -160,18 +217,15 @@ class GCN(MOAgent, MOPolicy):
         self.dominance_func = dominance_func
         self.l2_func = l2_func
         self.l2_params = l2_params
-
+ 
         if model_class and not issubclass(model_class, BaseGCNModel):
             raise ValueError("model_class must be a subclass of BaseGCNModel")
 
         if model_class is None:
-            if self.continuous_action:
-                model_class = ContinuousActionsGeneralModel
-            else:
-                model_class = DiscreteActionsGeneralModel
+            model_class = BaseGCNModel
 
         self.model = model_class(
-            self.observation_dim, self.action_dim, self.reward_dim, self.scaling_factor, hidden_dim=self.hidden_dim
+            self.observation_dim, self.action_dim, self.reward_dim, self.scaling_factor, hidden_dim=self.hidden_dim, nr_layers=self.nr_layers
         ).to(self.device)
         self.opt = th.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
@@ -184,21 +238,25 @@ class GCN(MOAgent, MOPolicy):
         """Get configuration of GCN model."""
         return {
             "env_id": self.env.unwrapped.spec.id,
+            "reward_dim": self.reward_dim,
             "batch_size": self.batch_size,
             "gamma": self.gamma,
             "learning_rate": self.learning_rate,
             "hidden_dim": self.hidden_dim,
+            "nr_layers": self.nr_layers,
             "scaling_factor": self.scaling_factor,
             "continuous_action": self.continuous_action,
             "noise": self.noise,
             "seed": self.seed,
-        }
+    }
 
     def update(self):
         """Update GCN model."""
         batch = []
+
         # randomly choose episodes from experience buffer
         s_i = self.np_random.choice(np.arange(len(self.experience_replay)), size=self.batch_size, replace=True)
+
         for i in s_i:
             # episode is tuple (return, transitions)
             ep = self.experience_replay[i][2]
@@ -206,15 +264,16 @@ class GCN(MOAgent, MOPolicy):
             # use it's return and leftover timesteps as desired return and horizon
             t = self.np_random.integers(0, len(ep))
             # reward contains return until end of episode
-            s_t, a_t, r_t, h_t = ep[t].observation, ep[t].action, np.float32(ep[t].reward), np.float32(len(ep) - t)
-            batch.append((s_t, a_t, r_t, h_t))
+            s_t, a_t, r_t, h_t, am_t = ep[t].observation, ep[t].action, np.float32(ep[t].reward), np.float32(len(ep) - t), ep[t].action_mask
+            batch.append((s_t, a_t, r_t, h_t, am_t))
 
-        obs, actions, desired_return, desired_horizon = zip(*batch)
-        prediction = self.model(
+        obs, actions, desired_return, desired_horizon, _ = zip(*batch)
+        probs = self.model(
             th.tensor(obs).to(self.device),
             th.tensor(desired_return).to(self.device),
             th.tensor(desired_horizon).unsqueeze(1).to(self.device),
         )
+        prediction = th.nn.functional.log_softmax(probs, dim=-1)
 
         self.opt.zero_grad()
         if self.continuous_action:
@@ -242,11 +301,28 @@ class GCN(MOAgent, MOPolicy):
         else:
             heapq.heappush(self.experience_replay, (1, step, transitions))
 
-    def _nlargest(self, n, threshold=0.2):
+    def _compute_route_contexts(self):
+        """Compute normalized demand context for each episode in the ER buffer.
+
+        Returns: array of shape (len(experience_replay),) with values in [0, 1].
+        """
+        if self.demand_context is None:
+            return np.zeros(len(self.experience_replay))
+        contexts = []
+        for ep in self.experience_replay:
+            transitions = ep[2]
+            cell_indices = [t.cell_index for t in transitions if t.cell_index >= 0]
+            if cell_indices:
+                contexts.append(np.mean(self.demand_context[cell_indices]))
+            else:
+                contexts.append(0.0)
+        return np.array(contexts)
+
+    def _nlargest(self, n):
         returns = np.array([e[2][0].reward for e in self.experience_replay])
         # crowding distance of each point, check ones that are too close together
         distances = crowding_distance(returns)
-        sma = np.argwhere(distances <= threshold).flatten()
+        sma = np.argwhere(distances <= self.cd_threshold).flatten()
 
         l2 = self.l2_func( returns, sma, self.l2_params )
 
@@ -263,7 +339,11 @@ class GCN(MOAgent, MOPolicy):
         episodes = self._nlargest(num_episodes)
         returns, horizons = list(zip(*[(e[2][0].reward, len(e[2])) for e in episodes]))
         # keep only non-dominated returns
+
+        #### New
         nd_i, _ = self.dominance_func(np.array(returns))
+        ####
+
         returns = np.array(returns)[nd_i]
         horizons = np.array(horizons)[nd_i]
         # pick random return from random best episode
@@ -279,13 +359,18 @@ class GCN(MOAgent, MOPolicy):
         desired_return = np.float32(desired_return)
         return desired_return, desired_horizon
 
-    def _act(self, obs: np.ndarray, desired_return, desired_horizon, eval_mode=False) -> int:
-        prediction = self.model(
+    def _act(self, obs: np.ndarray, desired_return, desired_horizon, action_mask, eval_mode=False) -> int:
+        probs = self.model(
             th.tensor([obs]).float().to(self.device),
             th.tensor([desired_return]).float().to(self.device),
             th.tensor([desired_horizon]).unsqueeze(1).float().to(self.device),
         )
+        # probs = probs.detach().cpu().numpy()[0]
+        probs = probs.detach()
 
+        # Apply the mask before log_softmax -- we add a large large number to the unmasked actions (Linear can return negative values)
+        prediction = th.nn.functional.log_softmax(probs.cpu() + action_mask * 10000, dim=-1)
+ 
         if self.continuous_action:
             action = prediction.detach().cpu().numpy()[0]
             if not eval_mode:
@@ -301,22 +386,29 @@ class GCN(MOAgent, MOPolicy):
                 action = self.np_random.choice(np.arange(len(log_probs)), p=np.exp(log_probs))
             return action
 
-    def _run_episode(self, env, desired_return, desired_horizon, max_return, eval_mode=False):
+    def _run_episode(self, env, desired_return, desired_horizon, max_return, starting_loc=None, eval_mode=False):
         transitions = []
-        obs, _ = env.reset()
+        state, info = env.reset(options={'loc':starting_loc})
+        states = [info['location_grid_coordinates']]
+        obs = state
         done = False
         while not done:
-            action = self._act(obs, desired_return, desired_horizon, eval_mode)
-            n_obs, reward, terminated, truncated, _ = env.step(action)
+            action = self._act(obs, desired_return, desired_horizon, info['action_mask'], eval_mode=eval_mode)
+            n_state, reward, terminated, truncated, info = env.step(action)
+            states.append(info['location_grid_coordinates'])
+            n_obs = n_state
             done = terminated or truncated
 
+            cell_idx = info.get('location_grid_index', -1)
             transitions.append(
                 Transition(
                     observation=obs,
                     action=action,
+                    action_mask=info['action_mask'],
                     reward=np.float32(reward).copy(),
                     next_observation=n_obs,
                     terminal=terminated,
+                    cell_index=cell_idx,
                 )
             )
 
@@ -326,7 +418,7 @@ class GCN(MOAgent, MOPolicy):
             desired_return = np.clip(desired_return - reward, None, max_return, dtype=np.float32)
             # clip desired horizon to avoid negative horizons
             desired_horizon = np.float32(max(desired_horizon - 1, 1.0))
-        return transitions
+        return transitions, states
 
     def set_desired_return_and_horizon(self, desired_return: np.ndarray, desired_horizon: int):
         """Set desired return and horizon for evaluation."""
@@ -337,7 +429,7 @@ class GCN(MOAgent, MOPolicy):
         """Evaluate policy action for a given observation."""
         return self._act(obs, self.desired_return, self.desired_horizon, eval_mode=True)
 
-    def evaluate(self, env, max_return, n=10):
+    def evaluate(self, env, max_return, n=10, starting_loc=None):
         """Evaluate policy in the given environment."""
         n = min(n, len(self.experience_replay))
         episodes = self._nlargest(n)
@@ -345,15 +437,24 @@ class GCN(MOAgent, MOPolicy):
         returns = np.float32(returns)
         horizons = np.float32(horizons)
         e_returns = []
+        e_states = []
+        e_cell_satisfaction = []
+        city = env.unwrapped.city if hasattr(env.unwrapped, 'city') else None
         for i in range(n):
-            transitions = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, eval_mode=True)
+            transitions, states = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, starting_loc=starting_loc, eval_mode=True)
             # compute return
-            for i in reversed(range(len(transitions) - 1)):
-                transitions[i].reward += self.gamma * transitions[i + 1].reward
+            for j in reversed(range(len(transitions) - 1)):
+                transitions[j].reward += self.gamma * transitions[j + 1].reward
             e_returns.append(transitions[0].reward)
+            e_states.append(states)
+
+            if city is not None:
+                line_indices = city.grid_to_index(np.array(states))
+                sat_rates, _ = city.compute_cell_satisfaction(line_indices)
+                e_cell_satisfaction.append(sat_rates)
 
         distances = np.linalg.norm(np.array(returns) - np.array(e_returns), axis=-1)
-        return e_returns, np.array(returns), distances
+        return np.array(e_returns), np.array(returns), distances, e_states, e_cell_satisfaction
 
     def save(self, filename: str = "GCN_model", savedir: str = "weights"):
         """Save GCN."""
@@ -368,12 +469,18 @@ class GCN(MOAgent, MOPolicy):
         ref_point: np.ndarray,
         known_pareto_front: Optional[List[np.ndarray]] = None,
         num_eval_weights_for_eval: int = 50,
-        num_er_episodes: int = 20,
+        num_er_episodes: int = 500,
         num_step_episodes: int = 10,
-        num_model_updates: int = 50,
-        max_return: np.ndarray = None,
-        max_buffer_size: int = 100,
+        num_model_updates: int = 100,
+        max_return: np.ndarray = 250.0,
+        max_buffer_size: int = 500,
         num_points_pf: int = 100,
+        starting_loc: Optional[np.ndarray] = None,
+        nr_stations: int = 9,
+        save_dir: str = "weights",
+        pf_plot_limits: Optional[List[int]] = [0, 0.5],
+        n_policies: int = 10,
+        cd_threshold: float = 0.2
     ):
         """Train GCN.
 
@@ -383,12 +490,17 @@ class GCN(MOAgent, MOPolicy):
             ref_point: reference point for hypervolume calculation
             known_pareto_front: Optimal pareto front for metrics calculation, if known.
             num_eval_weights_for_eval (int): Number of weights use when evaluating the Pareto front, e.g., for computing expected utility.
-            num_er_episodes: number of episodes to fill experience replay buffer
+            num_er_episodes: number of episodes to fill experience replay buffer.
             num_step_episodes: number of steps per episode
             num_model_updates: number of model updates per episode
-            max_return: maximum return for clipping desired return. When None, this will be set to 100 for all objectives.
+            max_return: maximum return for clipping desired return
             max_buffer_size: maximum buffer size
-            num_points_pf: number of points to sample from pareto front for metrics calculation
+            num_points_pf: int = 100,
+            starting_loc: starting location for episodes, if None, random location is used
+            save_dir: directory to save model weights
+            pf_plot_limits: limits for the pareto front plot (only for 2 objectives)
+            n_policies: number of policies to evaluate at each checkpoint
+            cd_threshold: threshold for crowding distance
         """
         max_return = max_return if max_return is not None else np.full(self.reward_dim, 100.0, dtype=np.float32)
         if self.log:
@@ -401,32 +513,67 @@ class GCN(MOAgent, MOPolicy):
                     "num_er_episodes": num_er_episodes,
                     "num_step_episodes": num_step_episodes,
                     "num_model_updates": num_model_updates,
-                    "max_return": max_return.tolist(),
+                    "starting_loc": starting_loc,
                     "max_buffer_size": max_buffer_size,
-                    "num_points_pf": num_points_pf,
+                    "num_policies": n_policies,
+                    "save_dir": save_dir,
+                    "nr_stations": nr_stations,
+                    "distance_ref": self.distance_ref,
+                    "lcn_lambda": self.lcn_lambda,
+                    "cd_threshold": cd_threshold,
+                    "lambda_schedule": self.lambda_schedule,
+                    "lambda_start": self.lambda_start,
+                    "lambda_end": self.lambda_end,
+                    "lambda_warmup_fraction": self.lambda_warmup_fraction,
+                    "lambda_freeze_fraction": self.lambda_freeze_fraction,
+                    "spatial_alpha": self.spatial_alpha,
                 }
             )
         self.global_step = 0
+
+        if self.lambda_schedule != 'constant' and self.lcn_lambda is not None:
+            self.lambda_scheduler = LambdaScheduler(
+                schedule_type=self.lambda_schedule,
+                lambda_start=self.lambda_start,
+                lambda_end=self.lambda_end,
+                total_timesteps=total_timesteps,
+                warmup_fraction=self.lambda_warmup_fraction,
+                freeze_fraction=self.lambda_freeze_fraction,
+            )
+            self.lcn_lambda = self.lambda_start
+
+        if hasattr(self.env.unwrapped, 'city'):
+            agg_od = self.env.unwrapped.city.agg_od_mx().flatten()
+            max_od = agg_od.max()
+            self.demand_context = agg_od / max_od if max_od > 0 else agg_od
         total_episodes = num_er_episodes
         n_checkpoints = 0
+        self.cd_threshold = cd_threshold
 
         # fill buffer with random episodes
         self.experience_replay = []
         for _ in range(num_er_episodes):
             transitions = []
-            obs, _ = self.env.reset()
+            obs, info = self.env.reset(options={'loc':starting_loc})
             done = False
             while not done:
-                action = self.env.action_space.sample()
-                n_obs, reward, terminated, truncated, _ = self.env.step(action)
-                transitions.append(Transition(obs, action, np.float32(reward).copy(), n_obs, terminated))
+                action = self.env.action_space.sample(mask=info['action_mask'])
+                n_obs, reward, terminated, truncated, info = self.env.step(action)
+                cell_idx = info.get('location_grid_index', -1)
+                transitions.append(Transition(obs, action, info['action_mask'], np.float32(reward).copy(), n_obs, terminated, cell_index=cell_idx))
                 done = terminated or truncated
                 obs = n_obs
                 self.global_step += 1
             # add episode in-place
             self._add_episode(transitions, max_size=max_buffer_size, step=self.global_step)
 
+        returns = None
         while self.global_step < total_timesteps:
+            if self.lambda_scheduler is not None:
+                self.lcn_lambda = self.lambda_scheduler.get_base_lambda(self.global_step)
+                if self.log:
+                    wandb.log({"train/lcn_lambda": self.lcn_lambda, "global_step": self.global_step}, commit=False)
+
             loss = []
             entropy = []
             for _ in range(num_model_updates):
@@ -464,7 +611,7 @@ class GCN(MOAgent, MOPolicy):
             returns = []
             horizons = []
             for _ in range(num_step_episodes):
-                transitions = self._run_episode(self.env, desired_return, desired_horizon, max_return)
+                transitions, _ = self._run_episode(self.env, desired_return, desired_horizon, max_return, starting_loc=starting_loc)
                 self.global_step += len(transitions)
                 self._add_episode(transitions, max_size=max_buffer_size, step=self.global_step)
                 returns.append(transitions[0].reward)
@@ -497,11 +644,19 @@ class GCN(MOAgent, MOPolicy):
             )
 
             if self.global_step >= (n_checkpoints + 1) * total_timesteps / 1000:
-                self.save()
+                self.save(savedir=save_dir, filename=f"LCN_model_{n_checkpoints}")
                 n_checkpoints += 1
-                e_returns, _, _ = self.evaluate(eval_env, max_return, n=num_points_pf)
+                e_returns, returns, _, e_states, e_cell_satisfaction = self.evaluate(eval_env, max_return, n=num_points_pf, starting_loc=starting_loc)
 
                 if self.log:
+                    city = eval_env.unwrapped.city if hasattr(eval_env.unwrapped, 'city') else None
+                    cell_sat = np.array(e_cell_satisfaction) if e_cell_satisfaction else None
+                    cell_dem = None
+                    agg_od = None
+                    if city is not None and cell_sat is not None and len(cell_sat) > 0:
+                        cell_dem = np.sum(city.od_mx, axis=1) + np.sum(city.od_mx, axis=0)
+                        agg_od = city.agg_od_mx().flatten()
+
                     log_all_multi_policy_metrics(
                         current_front=e_returns,
                         hv_ref_point=ref_point,
@@ -509,4 +664,8 @@ class GCN(MOAgent, MOPolicy):
                         global_step=self.global_step,
                         n_sample_weights=num_eval_weights_for_eval,
                         ref_front=known_pareto_front,
+                        cell_satisfaction_rates=cell_sat,
+                        cell_demands=cell_dem,
+                        agg_od_by_cell=agg_od,
                     )
+        self.env.close()
