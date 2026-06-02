@@ -133,24 +133,27 @@ def lorenz_l2( returns, sma, params ):
     assert lcn_lambda is not None, "lcn_lambda must be set when using distance_ref='interpolate(2/3)'"
     if distance_ref == 'interpolate':
         lv = lorenz_vector(np.array(returns))
-        non_dominated_i, _ = get_non_pareto_dominated(lv)
-        non_dominated = returns[non_dominated_i]
+        indices, _ = get_non_pareto_dominated(lv)
+        non_dominated = returns[indices]
         ginis = gini(non_dominated, normalized=True)
+
         # If no solution is left after filtering, take the ones with the lowest gini
         if spatial_alpha > 0 and route_contexts is not None:
-            nd_contexts = route_contexts[np.nonzero(non_dominated_i)[0]]
+            nd_contexts = route_contexts[np.nonzero(indices)[0]]
             effective_lambdas_nd = np.maximum(lcn_lambda, spatial_alpha * nd_contexts)
-            non_dominated_i = ginis <= effective_lambdas_nd
+            mask = ginis <= effective_lambdas_nd
         else:
-            non_dominated_i = ginis <= lcn_lambda
+            mask = ginis <= lcn_lambda
 
-        if non_dominated_i.sum() == 0:
+        if mask.sum() == 0:
             threshold = np.min(ginis)
-            non_dominated_i = ginis <= threshold
+            mask = ginis <= threshold
 
-        non_dominated = non_dominated[non_dominated_i]
+        non_dominated = non_dominated[mask]
         non_dominated_i = np.zeros(len(returns), dtype=bool)
-        non_dominated_i[]
+        indices = np.flatnonzero(indices)
+        non_dominated_i[indices[mask]] = True
+        non_dominated = returns[non_dominated_i]
 
     elif distance_ref == 'interpolate2':
         lv = lorenz_vector(np.array(returns))
@@ -161,7 +164,8 @@ def lorenz_l2( returns, sma, params ):
         else:
             fv = lcn_lambda * returns + (1 - lcn_lambda) * lv
 
-        non_dominated_i, non_dominated = get_non_pareto_dominated(fv)
+        non_dominated_i, _ = get_non_pareto_dominated(fv)
+        non_dominated = returns[non_dominated_i]
 
     elif distance_ref == 'interpolate3':
         # sort returns in increasing order
@@ -175,7 +179,8 @@ def lorenz_l2( returns, sma, params ):
         else:
             fv = lcn_lambda * returns + (1 - lcn_lambda) * lv
 
-        non_dominated_i, non_dominated = get_non_pareto_dominated(fv)
+        non_dominated_i, _ = get_non_pareto_dominated(fv)
+        non_dominated = returns[non_dominated_i]
 
     # we will compute distance of each point with each non-dominated point,
     # duplicate each point with number of non_dominated to compute respective distance
