@@ -48,7 +48,7 @@ class HyperparamScheduler:
         self._active_duration = max(self._freeze_start - self._warmup_end, 1)
 
     def step(self, current_step: int, params):
-        """Return the base lambda value at the given training step."""
+        """Return the base hyperparameter value at the given training step."""
         if current_step <= self._warmup_end:
             params[self.target_key] = self.start_val
             return

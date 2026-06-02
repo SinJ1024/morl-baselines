@@ -51,7 +51,8 @@ class GCN(MOAgent, MOPolicy):
         dominance_func: Optional[Callable] = None,
         l2_func: Optional[Callable] = None,
         l2_params: Optional[Dict] = None,
-        hyperparam_scheduler: HyperparamScheduler = None
+        hyperparam_scheduler: HyperparamScheduler = None,
+        cd_threshold: float = 0.2
     ) -> None:
         """Initialize GCN agent.
 
@@ -93,8 +94,9 @@ class GCN(MOAgent, MOPolicy):
         assert dominance_func is not None, "No fairness function defined for GCN cannot initialize model"
         self.dominance_func = dominance_func
         self.l2_func = l2_func
-        self.l2_params = l2_params
+        self.l2_params = l2_params if l2_params is not None else {}
         self.hyperparam_scheduler = hyperparam_scheduler
+        self.cd_threshold = cd_threshold
  
         if model_class and not issubclass(model_class, BaseGCNModel):
             raise ValueError("model_class must be a subclass of BaseGCNModel")
@@ -124,6 +126,7 @@ class GCN(MOAgent, MOPolicy):
             "scaling_factor": self.scaling_factor,
             "noise": self.noise,
             "seed": self.seed,
+            "cd_threshold": self.cd_threshold,
     }
 
     def update(self):
@@ -174,13 +177,32 @@ class GCN(MOAgent, MOPolicy):
         else:
             heapq.heappush(self.experience_replay, (1, step, transitions))
 
-    
+    def _compute_route_contexts(self):
+        """Compute normalized demand context for each episode in the ER buffer.
+ 
+        Returns: array of shape (len(experience_replay),) with values in [0, 1].
+        """
+        if self.l2_params.get('demand_context') is None:
+            return None
+
+        contexts = []
+        for ep in self.experience_replay:
+            transitions = ep[2]
+            cell_indices = [t.cell_index for t in transitions if t.cell_index >= 0]
+            if cell_indices:
+                contexts.append(np.mean(self.l2_params['demand_context'][cell_indices]))
+            else:
+                contexts.append(0.0)
+        return np.array(contexts)
+
+
     def _nlargest(self, n):
         returns = np.array([e[2][0].reward for e in self.experience_replay])
         # crowding distance of each point, check ones that are too close together
         distances = crowding_distance(returns)
         sma = np.argwhere(distances <= self.cd_threshold).flatten()
 
+        self.l2_params['route_contexts'] = self._compute_route_contexts()
         l2 = self.l2_func( returns, sma, self.l2_params )
 
         sorted_i = np.argsort(l2)
@@ -198,10 +220,9 @@ class GCN(MOAgent, MOPolicy):
         # keep only non-dominated returns
 
         #### New
-        nd_i, _ = self.dominance_func(np.array(returns))
+        nd_i, returns = self.dominance_func(np.array(returns), self.l2_params)
         ####
 
-        returns = np.array(returns)[nd_i]
         horizons = np.array(horizons)[nd_i]
         # pick random return from random best episode
         r_i = self.np_random.integers(0, len(returns))
@@ -329,8 +350,7 @@ class GCN(MOAgent, MOPolicy):
         nr_stations: int = 9,
         save_dir: str = "weights",
         pf_plot_limits: Optional[List[int]] = [0, 0.5],
-        n_policies: int = 10,
-        cd_threshold: float = 0.2
+        n_policies: int = 10
     ):
         """Train GCN.
 
@@ -368,7 +388,6 @@ class GCN(MOAgent, MOPolicy):
                     "num_policies": n_policies,
                     "save_dir": save_dir,
                     "nr_stations": nr_stations,
-                    "cd_threshold": cd_threshold,
                 }
             )
             if self.hyperparam_scheduler is not None:
@@ -387,10 +406,10 @@ class GCN(MOAgent, MOPolicy):
             self.l2_params['demand_context'] = agg_od / max_od if max_od > 0 else agg_od
         total_episodes = num_er_episodes
         n_checkpoints = 0
-        self.cd_threshold = cd_threshold
 
         # fill buffer with random episodes
         self.experience_replay = []
+
         for _ in range(num_er_episodes):
             transitions = []
             obs, info = self.env.reset(options={'loc':starting_loc})

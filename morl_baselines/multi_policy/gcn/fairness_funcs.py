@@ -5,7 +5,7 @@ from morl_baselines.common.performance_indicators import gini
 # Dominance Functions
 ######################################################################
 
-def get_non_pareto_dominated(solutions: np.ndarray, params):
+def get_non_pareto_dominated(solutions: np.ndarray, params=None):
     is_efficient = np.ones(solutions.shape[0], dtype=bool)
     for i, c in enumerate(solutions):
         if is_efficient[i]:
@@ -20,7 +20,7 @@ def get_nash_score(solutions: np.ndarray, shift=0.0, epsilon=1e-10):
     shifted = solutions + shift
     return np.mean(np.log(np.maximum(shifted, epsilon)), axis=1)
 
-def get_nash_dominated(solution: np.ndarray, params):
+def get_nash_dominated(solutions: np.ndarray, params):
     """
     """
     params = params or {}
@@ -37,19 +37,19 @@ def get_nash_dominated(solution: np.ndarray, params):
         top_k = max(1, min(top_k, pareto_size))
         pf_indices = np.flatnonzero(pareto_mask)
         pf_scores = scores[pareto_mask]
-        if top_k < len(pf_scores)
+        if top_k < len(pf_scores):
             pf_top_k = np.argpartition(pf_scores, -top_k)[-top_k:]
             pf_indices = pf_indices[pf_top_k]
  
     elif mode == 'pareto_sized':
         if pareto_size >= len(scores):
-            mask = np.ones(len(scores), type=bool)
+            mask = np.ones(len(scores), dtype=bool)
             return mask, solutions[mask]
-        best = np.argpartition(scores, -pareto_size)[-pareto_size:]
+        pf_indices = np.argpartition(scores, -pareto_size)[-pareto_size:]
 
     mask = np.zeros(len(solutions), dtype=bool)
-    mask[best] = True
-    return mask, solution[mask]
+    mask[pf_indices] = True
+    return mask, solutions[mask]
 
 ######################################################################
 # Utility Functions
@@ -64,24 +64,6 @@ def lorenz_vector(points, proportional=False):
         lv = lv / np.sum(points, axis=1, keepdims=True)
  
     return lv
-
-def compute_route_contexts(demand_context, experience_replay):
-    """Compute normalized demand context for each episode in the ER buffer.
-
-    Returns: array of shape (len(experience_replay),) with values in [0, 1].
-    """
-    if demand_context is None:
-        return np.zeros(len(experience_replay))
-    contexts = []
-    for ep in experience_replay:
-        transitions = ep[2]
-        cell_indices = [t.cell_index for t in transitions if t.cell_index >= 0]
-        if cell_indices:
-            contexts.append(np.mean(demand_context[cell_indices]))
-        else:
-            contexts.append(0.0)
-    return np.array(contexts)
-
 def penalize_crowding(non_dominated_i, non_dominated, l2, sma):
     """Penalize crowding if points by setting a penalty to all points that are too close together (crowding distance < threshold)
     Args:
@@ -125,7 +107,8 @@ def lorenz_l2( returns, sma, params ):
 
     if distance_ref == 'nondominated_mean':
         lv = lorenz_vector(np.array(returns))
-        non_dominated_i, non_dominated = get_non_pareto_dominated(lv)
+        non_dominated_i, _ = get_non_pareto_dominated(lv)
+        non_dominated = returns[non_dominated_i]
 
         optimal = np.full_like(returns, non_dominated.mean(axis=0))
         l2 = np.linalg.norm(returns - optimal, axis=-1) * -1
@@ -145,37 +128,34 @@ def lorenz_l2( returns, sma, params ):
         l2[sma] *= 2
         return l2
  
-    spatial_alpha = params['spatial_alpha']
-    demand_context = params['demand_context']
-    experience_replay = params['experience_replay']
+    spatial_alpha = params.get('spatial_alpha', 0.0)
+    route_contexts = params.get('route_contexts', None)
     assert lcn_lambda is not None, "lcn_lambda must be set when using distance_ref='interpolate(2/3)'"
     if distance_ref == 'interpolate':
         lv = lorenz_vector(np.array(returns))
-        non_dominated_i, non_dominated = get_non_pareto_dominated(lv)
+        non_dominated_i, _ = get_non_pareto_dominated(lv)
+        non_dominated = returns[non_dominated_i]
         ginis = gini(non_dominated, normalized=True)
-        # Filter out the ND points whose gini is > lamda (or the min gini)
-        non_dominated_i = ginis <= lcn_lambda
         # If no solution is left after filtering, take the ones with the lowest gini
-        if spatial_alpha > 0 and demand_context is not None:
-            route_contexts = compute_route_contexts(demand_context, experience_replay)
-            non_dominated_i, _ = get_non_pareto_dominated(returns)
+        if spatial_alpha > 0 and route_contexts is not None:
             nd_contexts = route_contexts[np.nonzero(non_dominated_i)[0]]
             effective_lambdas_nd = np.maximum(lcn_lambda, spatial_alpha * nd_contexts)
             non_dominated_i = ginis <= effective_lambdas_nd
         else:
             non_dominated_i = ginis <= lcn_lambda
-        if sum(non_dominated_i) == 0:
+
+        if non_dominated_i.sum() == 0:
             threshold = np.min(ginis)
             non_dominated_i = ginis <= threshold
+
         non_dominated = non_dominated[non_dominated_i]
+        non_dominated_i = np.zeros(len(returns), dtype=bool)
+        non_dominated_i[]
 
     elif distance_ref == 'interpolate2':
         lv = lorenz_vector(np.array(returns))
-        # The final vector is a weighted average of the lorenz vector and the full returns
-        fv = lcn_lambda * returns + (1 - lcn_lambda) * lv
 
-        if spatial_alpha > 0 and demand_context is not None:
-            route_contexts = compute_route_contexts(demand_context, experience_replay)
+        if spatial_alpha > 0 and route_contexts is not None:
             effective_lambdas = np.maximum(lcn_lambda, spatial_alpha * route_contexts)
             fv = effective_lambdas[:, np.newaxis] * returns + (1 - effective_lambdas[:, np.newaxis]) * lv
         else:
@@ -189,8 +169,7 @@ def lorenz_l2( returns, sma, params ):
 
         lv = lorenz_vector(np.array(returns))
         # The final vector is a weighted average of the lorenz vector and the full returns
-        if spatial_alpha > 0 and demand_context is not None:
-            route_contexts = compute_route_contexts(demand_context, experience_replay)
+        if spatial_alpha > 0 and route_contexts is not None:
             effective_lambdas = np.maximum(lcn_lambda, spatial_alpha * route_contexts)
             fv = effective_lambdas[:, np.newaxis] * returns + (1 - effective_lambdas[:, np.newaxis]) * lv
         else:
@@ -209,15 +188,15 @@ def lorenz_l2( returns, sma, params ):
     return l2
 
 def nash_l2( returns, sma, params ):
-    non_dominated_i, non_dominated = get_nash_dominated(returns)
+    non_dominated_i, non_dominated = get_nash_dominated(returns, params)
 
     # we will compute distance of each point with each non-dominated point,
     # duplicate each point with number of non_dominated to compute respective distance
-    returns_exp = np.tile(np.expand_dims(returns, 1), (1, len(scores), 1))
+    returns_exp = np.tile(np.expand_dims(returns, 1), (1, len(non_dominated), 1))
     # distance to closest non_dominated point
-    l2 = np.min(np.linalg.norm(returns_exp - scores, axis=-1), axis=-1) * -1
+    l2 = np.min(np.linalg.norm(returns_exp - non_dominated, axis=-1), axis=-1) * -1
 
-    l2 = penalize_crowding( scores_i, scores, l2, sma )
+    l2 = penalize_crowding( non_dominated_i, non_dominated, l2, sma )
  
     return l2
 
