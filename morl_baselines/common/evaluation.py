@@ -12,12 +12,14 @@ from pymoo.util.ref_dirs import get_reference_directions
 from morl_baselines.common.pareto import filter_pareto_dominated
 from morl_baselines.common.performance_indicators import (
     cardinality,
+    demand_coverage,
     expected_utility,
     gini,
     hypervolume,
     igd,
-    max_min_satisfaction_floor,
     maximum_utility_loss,
+    price_equity,
+    served_floor,
     spatial_sen_welfare,
 )
 from morl_baselines.common.weights import equally_spaced_weights
@@ -184,6 +186,7 @@ def log_all_multi_policy_metrics(
     cell_satisfaction_rates: Optional[np.ndarray] = None,
     cell_demands: Optional[np.ndarray] = None,
     agg_od_by_cell: Optional[np.ndarray] = None,
+    house_prices: Optional[np.ndarray] = None,
 ):
     """Logs all metrics for multi-policy training.
 
@@ -215,6 +218,11 @@ def log_all_multi_policy_metrics(
     gi = gini(np.array(filtered_front))
     utils_sum = np.sum(filtered_front, axis=1)
     nash_welfare = np.prod(filtered_front, axis=1)
+    # Geometric-mean Nash welfare: the raw product underflows and collapses to ~0
+    # when G is large (e.g. 10 groups). The geometric mean stays on the scale of a
+    # single group return and remains informative, while still vanishing only when
+    # a group is left entirely unserved.
+    nash_welfare_geom = np.exp(np.mean(np.log(np.clip(np.asarray(filtered_front), 1e-8, None)), axis=1))
     sen_welfare = utils_sum * (1 - gi)
 
     metrics = {
@@ -230,12 +238,20 @@ def log_all_multi_policy_metrics(
         "eval/sen_welfare_max": np.max(sen_welfare),
         "eval/nash_welfare_median": np.median(nash_welfare),
         "eval/nash_welfare_max": np.max(nash_welfare),
+        "eval/nash_welfare_geom_median": np.median(nash_welfare_geom),
+        "eval/nash_welfare_geom_max": np.max(nash_welfare_geom),
     }
 
     if cell_satisfaction_rates is not None and cell_demands is not None:
-        floor_vals = max_min_satisfaction_floor(cell_satisfaction_rates, cell_demands)
-        metrics["eval/maxmin_floor_median"] = np.median(floor_vals)
-        metrics["eval/maxmin_floor_max"] = np.max(floor_vals)
+        # Worst service quality among cells the line actually reaches (non-degenerate floor)
+        sf = served_floor(cell_satisfaction_rates, cell_demands)
+        metrics["eval/served_floor_median"] = np.median(sf)
+        metrics["eval/served_floor_max"] = np.max(sf)
+
+        # Spatial reach: fraction of demand VOLUME served (demand-weighted)
+        dc = demand_coverage(cell_satisfaction_rates, cell_demands)
+        metrics["eval/demand_coverage_median"] = np.median(dc)
+        metrics["eval/demand_coverage_max"] = np.max(dc)
 
         if agg_od_by_cell is not None:
             sw_high, sw_low = spatial_sen_welfare(cell_satisfaction_rates, cell_demands, agg_od_by_cell)
@@ -243,6 +259,14 @@ def log_all_multi_policy_metrics(
             metrics["eval/spatial_sw_low_median"] = np.median(sw_low)
             sw_high_med = np.median(sw_high)
             metrics["eval/spatial_sw_ratio"] = np.median(sw_low) / (sw_high_med + 1e-8)
+
+        # Service in affordable vs. expensive areas (>1 = pro-affordable).
+        if house_prices is not None:
+            sat_low, sat_high, pe = price_equity(cell_satisfaction_rates, cell_demands, house_prices)
+            metrics["eval/price_sat_low_median"] = np.median(sat_low)
+            metrics["eval/price_sat_high_median"] = np.median(sat_high)
+            metrics["eval/price_equity_ratio_median"] = np.median(pe)
+            metrics["eval/price_equity_ratio_max"] = np.max(pe)
 
     wandb.log(metrics, commit=False)
     front = wandb.Table(

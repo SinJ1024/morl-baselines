@@ -138,29 +138,69 @@ def gini(x, normalized=True):
     Returns:
         float: Gini index
     """
+    x = np.asarray(x, dtype=float)
     sorted_x = np.sort(x, axis=1)
     n = x.shape[1]
     cum_x = np.cumsum(sorted_x, axis=1, dtype=float)
-    gi = (n + 1 - 2 * np.sum(cum_x, axis=1) / cum_x[:, -1]) / n
-    if normalized:
+    total = cum_x[:, -1]
+    # guard against all-zero rows (total == 0): gini is undefined -> treat as 0 (no inequality)
+    safe_total = np.where(total == 0, 1.0, total)
+    gi = (n + 1 - 2 * np.sum(cum_x, axis=1) / safe_total) / n
+    gi = np.where(total == 0, 0.0, gi)
+    if normalized and n > 1:
         gi = gi * (n / (n - 1))
     return gi
 
 
-def max_min_satisfaction_floor(cell_satisfaction_rates: np.ndarray, cell_demands: np.ndarray) -> np.ndarray:
-    """Rawlsian Max-Min Satisfaction Floor: min satisfaction rate across cells with nonzero demand.
+def served_floor(cell_satisfaction_rates: np.ndarray, cell_demands: np.ndarray) -> np.ndarray:
+    """Worst service quality among cells the line actually reaches.
+
+    min satisfaction among demand cells with satisfaction > 0. Unlike a Rawlsian
+    floor over ALL demand cells (which is always 0 when a single 20-station line
+    covers only ~3% of cells), this conditions on served cells so it is non-degenerate.
+
+    NOTE: must be read together with demand_coverage — a route serving a single cell
+    perfectly scores 1.0 here. High served_floor + high demand_coverage = genuinely good.
 
     Args:
-        cell_satisfaction_rates: shape (n_lines, grid_size) — per-cell satisfaction per evaluated line.
-        cell_demands: shape (grid_size,) — per-cell total demand.
+        cell_satisfaction_rates: shape (n_lines, grid_size).
+        cell_demands: shape (grid_size,).
 
     Returns:
-        np.ndarray: shape (n_lines,) — floor metric for each evaluated line.
+        np.ndarray: shape (n_lines,) — served floor for each line.
     """
     has_demand = cell_demands > 0
-    if not np.any(has_demand):
+    n_lines = cell_satisfaction_rates.shape[0]
+    result = np.zeros(n_lines)
+    for i in range(n_lines):
+        served_mask = has_demand & (cell_satisfaction_rates[i] > 0)
+        if np.any(served_mask):
+            result[i] = np.min(cell_satisfaction_rates[i, served_mask])
+    return result
+
+
+def demand_coverage(cell_satisfaction_rates: np.ndarray, cell_demands: np.ndarray) -> np.ndarray:
+    """Fraction of total demand VOLUME that is served (demand-weighted reach).
+
+    Unlike a raw cell-count reach metric (~pinned by the station budget), this weights
+    by demand so reaching a high-demand cell counts more than a low-demand one.
+
+    Args:
+        cell_satisfaction_rates: shape (n_lines, grid_size).
+        cell_demands: shape (grid_size,).
+
+    Returns:
+        np.ndarray: shape (n_lines,) — served demand fraction in [0, 1] for each line.
+    """
+    has_demand = cell_demands > 0
+    total_demand = cell_demands[has_demand].sum()
+    if total_demand == 0:
         return np.zeros(cell_satisfaction_rates.shape[0])
-    return np.min(cell_satisfaction_rates[:, has_demand], axis=1)
+    served_demand = np.sum(
+        (cell_satisfaction_rates[:, has_demand] > 0).astype(float) * cell_demands[has_demand],
+        axis=1,
+    )
+    return served_demand / total_demand
 
 
 def spatial_sen_welfare(
@@ -188,18 +228,78 @@ def spatial_sen_welfare(
     threshold = np.median(agg_od_by_cell[has_demand])
     high_mask = has_demand & (agg_od_by_cell >= threshold)
     low_mask = has_demand & (agg_od_by_cell < threshold)
+    n_lines = cell_satisfaction_rates.shape[0]
 
     def _region_welfare(mask):
-        n_lines = cell_satisfaction_rates.shape[0]
-        n_cells = np.sum(mask)
-        if n_cells < 2:
-            satisfied = np.sum(cell_satisfaction_rates[:, mask] * cell_demands[mask], axis=1)
-            return satisfied
-
-        region_sr = cell_satisfaction_rates[:, mask]
-        satisfied = np.sum(region_sr * cell_demands[mask], axis=1)
-        gi = gini(region_sr, normalized=True)
-        gi = np.clip(gi, 0.0, 1.0)
-        return satisfied * (1 - gi)
+        if np.sum(mask) == 0:
+            return np.zeros(n_lines)
+        region_sr = cell_satisfaction_rates[:, mask]          # (n_lines, n_region_cells)
+        w = cell_demands[mask]
+        total_w = w.sum()
+        # demand-weighted MEAN satisfaction in region, normalized to [0, 1]
+        # (so high/low regions are comparable regardless of their demand mass)
+        mean_sat = (region_sr * w).sum(axis=1) / (total_w + 1e-12)
+        welfare = np.zeros(n_lines)
+        for i in range(n_lines):
+            served = region_sr[i] > 0
+            # inequality among SERVED cells only — avoids gini saturating to 1 on the
+            # mostly-zero (unserved) cells, which previously crushed welfare to ~0
+            if served.sum() >= 2:
+                gi = float(gini(region_sr[i][served][None, :], normalized=True)[0])
+                gi = np.clip(gi, 0.0, 1.0)
+            else:
+                gi = 0.0
+            welfare[i] = mean_sat[i] * (1.0 - gi)
+        return welfare
 
     return _region_welfare(high_mask), _region_welfare(low_mask)
+
+
+def price_equity(
+    cell_satisfaction_rates: np.ndarray,
+    cell_demands: np.ndarray,
+    house_prices: np.ndarray,
+) -> tuple:
+    """Housing-price equity: transit service in affordable vs. expensive areas.
+
+    Splits cells (with both demand and price data) into low/high price by median.
+    For each group computes demand-weighted MEAN satisfaction (in [0, 1]).
+    equity_ratio = sat_low / sat_high  (>1 = pro-affordable, the fair direction).
+
+    Args:
+        cell_satisfaction_rates: shape (n_lines, grid_size).
+        cell_demands: shape (grid_size,).
+        house_prices: shape (grid_size,) — 0 = no price data.
+
+    Returns:
+        (sat_low, sat_high, equity_ratio): each shape (n_lines,).
+    """
+    n_lines = cell_satisfaction_rates.shape[0]
+    zeros = np.zeros(n_lines)
+
+    valid = (cell_demands > 0) & (house_prices > 0)
+    if np.sum(valid) < 4:
+        return zeros, zeros, np.ones(n_lines)
+
+    median_price = np.median(house_prices[valid])
+    low_price_mask = valid & (house_prices < median_price)
+    high_price_mask = valid & (house_prices >= median_price)
+
+    def _weighted_mean_sat(mask):
+        if np.sum(mask) == 0:
+            return zeros
+        weights = cell_demands[mask]
+        total_w = np.sum(weights)
+        if total_w == 0:
+            return zeros
+        return np.sum(cell_satisfaction_rates[:, mask] * weights, axis=1) / total_w
+
+    sat_low = _weighted_mean_sat(low_price_mask)
+    sat_high = _weighted_mean_sat(high_price_mask)
+
+    # FIX: when a line serves no expensive cells, the ratio is undefined.
+    # Set it to 1.0 (neutral) instead of dividing by ~1e-10 (which exploded to ~1e10).
+    ratio = np.ones(n_lines)
+    nz = sat_high > 0
+    ratio[nz] = sat_low[nz] / sat_high[nz]
+    return sat_low, sat_high, ratio
