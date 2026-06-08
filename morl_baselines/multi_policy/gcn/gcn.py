@@ -498,7 +498,7 @@ class GCN(MOAgent, MOPolicy):
             if self.global_step >= (n_checkpoints + 1) * total_timesteps / int(os.environ.get("GCN_N_EVALS", "30")):
                 self.save(savedir=save_dir, filename=f"GCN_model_{n_checkpoints}")
                 n_checkpoints += 1
-                e_returns, returns, _, e_states, e_cell_satisfaction = self.evaluate(eval_env, max_return, n=num_points_pf, starting_loc=starting_loc)
+                e_returns, returns, _, e_states, e_cell_satisfaction = self.evaluate(eval_env, max_return, n=int(os.environ.get("GCN_N_POINTS_PF", "20")), starting_loc=starting_loc)
 
                 if self.log:
                     city = eval_env.unwrapped.city if hasattr(eval_env.unwrapped, 'city') else None
