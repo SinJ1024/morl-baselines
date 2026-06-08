@@ -268,12 +268,14 @@ def log_all_multi_policy_metrics(
             metrics["eval/price_equity_ratio_median"] = np.median(pe)
             metrics["eval/price_equity_ratio_max"] = np.max(pe)
 
-    wandb.log(metrics, commit=False)
-    front = wandb.Table(
-        columns=[f"objective_{i}" for i in range(1, reward_dim + 1)],
-        data=[p.tolist() for p in filtered_front],
-    )
-    wandb.log({"eval/front": front})
+    wandb.log(metrics, commit=True)
+    # The per-eval front Table upload is the main wandb bottleneck; off by default.
+    if os.environ.get("WANDB_LOG_FRONT", "0") == "1":
+        front = wandb.Table(
+            columns=[f"objective_{i}" for i in range(1, reward_dim + 1)],
+            data=[p.tolist() for p in filtered_front],
+        )
+        wandb.log({"eval/front": front})
 
     # If PF is known, log the additional metrics
     if ref_front is not None:

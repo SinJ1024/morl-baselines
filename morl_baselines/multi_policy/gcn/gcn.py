@@ -495,7 +495,7 @@ class GCN(MOAgent, MOPolicy):
                 f"step {self.global_step} \t return {np.mean(returns, axis=0)}, ({np.std(returns, axis=0)}) \t loss {np.mean(loss):.3E} \t horizons {np.mean(horizons)}"
             )
 
-            if self.global_step >= (n_checkpoints + 1) * total_timesteps / 1000:
+            if self.global_step >= (n_checkpoints + 1) * total_timesteps / int(os.environ.get("GCN_N_EVALS", "30")):
                 self.save(savedir=save_dir, filename=f"GCN_model_{n_checkpoints}")
                 n_checkpoints += 1
                 e_returns, returns, _, e_states, e_cell_satisfaction = self.evaluate(eval_env, max_return, n=num_points_pf, starting_loc=starting_loc)
