@@ -17,18 +17,23 @@ def get_non_pareto_dominated(solutions: np.ndarray, params=None):
     return is_efficient, solutions[is_efficient]
 
 def get_nash_score(solutions: np.ndarray, shift=0.0, epsilon=1e-10):
-    shifted = solutions + shift
-    return np.mean(np.log(np.maximum(shifted, epsilon)), axis=1)
+    shifted = np.maximum(solutions + shift, epsilon)
+    return np.mean(np.log(shifted), axis=1)
+
+def get_alpha_score(solutions: np.ndarray, shift=0.0, epsilon=1e-10):
+    shifted = np.maximum(solutions + shift, epsilon)
+    return np.mean( (shifted ** (1-alpha))/(1-alpha), axis=1)
 
 def get_nash_dominated(solutions: np.ndarray, params):
-    """
-    """
     params = params or {}
     mode = params.get('mode', 'pareto_filter')
     shift = params.get('shift', 0.0)
     epsilon = params.get('epsilon', 1e-10)
 
-    scores = get_nash_score(solutions, shift=shift, epsilon=epsilon)
+    if params['criterion'] == "nash":
+        scores = get_nash_score(solutions, shift=shift, epsilon=epsilon)
+    elif params['criterion'] == 'alpha':
+        scores = get_alpha_score(solutions, shift=shift, epsilon=epsilon)
     pareto_mask, _ = get_non_pareto_dominated(solutions)
     pareto_size = int(pareto_mask.sum())
 
@@ -42,9 +47,6 @@ def get_nash_dominated(solutions: np.ndarray, params):
             pf_indices = pf_indices[pf_top_k]
  
     elif mode == 'pareto_sized':
-        if pareto_size >= len(scores):
-            mask = np.ones(len(scores), dtype=bool)
-            return mask, solutions[mask]
         pf_indices = np.argpartition(scores, -pareto_size)[-pareto_size:]
 
     mask = np.zeros(len(solutions), dtype=bool)
@@ -64,6 +66,7 @@ def lorenz_vector(points, proportional=False):
         lv = lv / np.sum(points, axis=1, keepdims=True)
  
     return lv
+
 def penalize_crowding(non_dominated_i, non_dominated, l2, sma):
     """Penalize crowding if points by setting a penalty to all points that are too close together (crowding distance < threshold)
     Args:

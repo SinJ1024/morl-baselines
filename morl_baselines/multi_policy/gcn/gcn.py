@@ -50,7 +50,7 @@ class GCN(MOAgent, MOPolicy):
         model_class: Optional[Type[BaseGCNModel]] = None,
         dominance_func: Optional[Callable] = None,
         l2_func: Optional[Callable] = None,
-        l2_params: Optional[Dict] = None,
+        fairness_params: Optional[Dict] = None,
         hyperparam_scheduler: HyperparamScheduler = None,
         cd_threshold: float = 0.2
     ) -> None:
@@ -74,7 +74,7 @@ class GCN(MOAgent, MOPolicy):
             model_class (Optional[Type[BaseGCNModel]], optional): Model class to use. Defaults to None.
             dominance_func (Callable, optional): Function that provides a fairness ranking between strategies.
             l2_func (Callable, optional): Function that provides the distances for crowding calculation
-            l2_params (Dict, optional): Paramaters for l2_func
+            fairness_params (Dict, optional): Paramaters for l2_func
             hyperparam_scheduler (HyperparamScheduler): A scheduler that may edit the model's hyperparameters during training. Currently only used for LCN's lambda
         """
         MOAgent.__init__(self, env, device=device, seed=seed)
@@ -94,7 +94,7 @@ class GCN(MOAgent, MOPolicy):
         assert dominance_func is not None, "No fairness function defined for GCN cannot initialize model"
         self.dominance_func = dominance_func
         self.l2_func = l2_func
-        self.l2_params = l2_params if l2_params is not None else {}
+        self.fairness_params = fairness_params if fairness_params is not None else {}
         self.hyperparam_scheduler = hyperparam_scheduler
         self.cd_threshold = cd_threshold
  
@@ -182,7 +182,7 @@ class GCN(MOAgent, MOPolicy):
  
         Returns: array of shape (len(experience_replay),) with values in [0, 1].
         """
-        if self.l2_params.get('demand_context') is None:
+        if self.fairness_params.get('demand_context') is None:
             return None
 
         contexts = []
@@ -190,7 +190,7 @@ class GCN(MOAgent, MOPolicy):
             transitions = ep[2]
             cell_indices = [t.cell_index for t in transitions if t.cell_index >= 0]
             if cell_indices:
-                contexts.append(np.mean(self.l2_params['demand_context'][cell_indices]))
+                contexts.append(np.mean(self.fairness_params['demand_context'][cell_indices]))
             else:
                 contexts.append(0.0)
         return np.array(contexts)
@@ -202,8 +202,8 @@ class GCN(MOAgent, MOPolicy):
         distances = crowding_distance(returns)
         sma = np.argwhere(distances <= self.cd_threshold).flatten()
 
-        self.l2_params['route_contexts'] = self._compute_route_contexts()
-        l2 = self.l2_func( returns, sma, self.l2_params )
+        self.fairness_params['route_contexts'] = self._compute_route_contexts()
+        l2 = self.l2_func( returns, sma, self.fairness_params )
 
         sorted_i = np.argsort(l2)
         largest = [self.experience_replay[i] for i in sorted_i[-n:]]
@@ -220,7 +220,7 @@ class GCN(MOAgent, MOPolicy):
         # keep only non-dominated returns
 
         #### New
-        nd_i, returns = self.dominance_func(np.array(returns), self.l2_params)
+        nd_i, returns = self.dominance_func(np.array(returns), self.fairness_params)
         ####
 
         horizons = np.array(horizons)[nd_i]
@@ -393,17 +393,17 @@ class GCN(MOAgent, MOPolicy):
             if self.hyperparam_scheduler is not None:
                 self.register_additional_config(
                     self.hyperparam_scheduler.get_config()
-                    #"spatial_alpha": self.l2_params['spatial_alpha']
+                    #"spatial_alpha": self.fairness_params['spatial_alpha']
                 )
         self.global_step = 0
 
         if self.hyperparam_scheduler is not None:
-            self.hyperparam_scheduler.step(0, self.l2_params)
+            self.hyperparam_scheduler.step(0, self.fairness_params)
 
         if hasattr(self.env.unwrapped, 'city'):
             agg_od = self.env.unwrapped.city.agg_od_mx().flatten()
             max_od = agg_od.max()
-            self.l2_params['demand_context'] = agg_od / max_od if max_od > 0 else agg_od
+            self.fairness_params['demand_context'] = agg_od / max_od if max_od > 0 else agg_od
         total_episodes = num_er_episodes
         n_checkpoints = 0
 
@@ -428,10 +428,10 @@ class GCN(MOAgent, MOPolicy):
         returns = None
         while self.global_step < total_timesteps:
             if self.hyperparam_scheduler is not None:
-                self.hyperparam_scheduler.step(self.global_step, self.l2_params)
+                self.hyperparam_scheduler.step(self.global_step, self.fairness_params)
                 if self.log:
                     key = self.hyperparam_scheduler.target_key
-                    wandb.log({f"train/{key}": self.l2_params[key], "global_step": self.global_step}, commit=False)
+                    wandb.log({f"train/{key}": self.fairness_params[key], "global_step": self.global_step}, commit=False)
 
             loss = []
             entropy = []
