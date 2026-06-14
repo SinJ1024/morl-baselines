@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 
-from morl_baselines.common.evaluation import log_all_multi_policy_metrics
+from morl_baselines.common.evaluation import log_all_multi_policy_metrics, _normalized_hypervolume
 from morl_baselines.multi_policy.gcn.hyperparam_scheduler import HyperparamScheduler
 from morl_baselines.multi_policy.gcn.gcn_model_classes import BaseGCNModel, DefaultGCNModel
 from morl_baselines.multi_policy.gcn.helpers import crowding_distance
@@ -449,7 +449,7 @@ class GCN(MOAgent, MOPolicy):
             # leaves_h = np.array([len(e[2]) for e in self.experience_replay[len(self.experience_replay) // 2 :]])
 
             if self.log:
-                hv = hypervolume(ref_point, leaves_r)
+                hv, _ = _normalized_hypervolume(list(leaves_r), self.reward_dim)
                 hv_est = hv
                 wandb.log(
                     {

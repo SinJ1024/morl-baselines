@@ -176,6 +176,36 @@ def policy_evaluation_mo(
     )
 
 
+def _normalized_hypervolume(front: List[np.ndarray], reward_dim: int):
+    """Hypervolume made usable in the many-objective, low-satisfaction TNDP regime.
+
+    With G=10 objectives, a reference point at the origin, per-group satisfaction ~0.02,
+    and every front point leaving at least one group at exactly 0, the raw HV collapses
+    to exactly 0. We (a) normalize each objective by its achievable (empirical) max so
+    the G-fold product does not underflow, and (b) use a reference point strictly below
+    the floor so policies that miss a group still contribute volume. We also return the
+    per-dimension HV (G-th root), which lives on the scale of a single objective and
+    stays comparable across runs.
+
+    NOTE: the normalizer is the per-front empirical max, so HV is best compared across
+    runs with similar absolute scale (e.g. the GCN lambda-mechanism ablation). For a
+    fully shared scale, normalize by a fixed per-dim constant in a post-hoc pass.
+
+    Returns:
+        (hv, hv_pdim): normalized HV and its per-dimension (G-th root) value.
+    """
+    arr = np.asarray(front, dtype=float)
+    if arr.size == 0:
+        return 0.0, 0.0
+    dim_max = arr.max(axis=0)
+    norm = np.where(dim_max > 0, dim_max, 1.0)
+    norm_front = arr / norm
+    eff_ref = np.full(reward_dim, -0.05)
+    hv = float(hypervolume(eff_ref, norm_front))
+    hv_pdim = hv ** (1.0 / reward_dim) if hv > 0 else 0.0
+    return hv, hv_pdim
+
+
 def log_all_multi_policy_metrics(
     current_front: List[np.ndarray],
     hv_ref_point: np.ndarray,
@@ -212,7 +242,9 @@ def log_all_multi_policy_metrics(
         agg_od_by_cell: shape (grid_size,) — aggregated OD demand per cell
     """
     filtered_front = list(filter_pareto_dominated(current_front))
-    hv = hypervolume(hv_ref_point, filtered_front)
+    # Normalized + ref-below-floor HV so it does not collapse to 0 at G=10 (see
+    # _normalized_hypervolume). hv_pdim is the per-dimension (G-th root) value.
+    hv, hv_pdim = _normalized_hypervolume(filtered_front, reward_dim)
     eum = expected_utility(filtered_front, weights_set=equally_spaced_weights(reward_dim, n_sample_weights))
     card = cardinality(filtered_front)
     gi = gini(np.array(filtered_front))
@@ -227,6 +259,7 @@ def log_all_multi_policy_metrics(
 
     metrics = {
         "eval/hypervolume": hv,
+        "eval/hypervolume_pdim": hv_pdim,
         "eval/eum": eum,
         "eval/cardinality": card,
         "global_step": global_step,

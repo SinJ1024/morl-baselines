@@ -394,16 +394,23 @@ class PCNTNDP(MOAgent, MOPolicy):
         horizons = np.float32(horizons)
         e_returns = []
         e_states = []
+        e_cell_satisfaction = []
+        city = env.unwrapped.city if hasattr(env.unwrapped, 'city') else None
         for i in range(n):
             transitions, states = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, starting_loc=starting_loc, eval_mode=True)
             # compute return
-            for i in reversed(range(len(transitions) - 1)):
-                transitions[i].reward += self.gamma * transitions[i + 1].reward
+            for j in reversed(range(len(transitions) - 1)):
+                transitions[j].reward += self.gamma * transitions[j + 1].reward
             e_returns.append(transitions[0].reward)
             e_states.append(states)
 
+            if city is not None:
+                line_indices = city.grid_to_index(np.array(states))
+                sat_rates, _ = city.compute_cell_satisfaction(line_indices)
+                e_cell_satisfaction.append(sat_rates)
+
         distances = np.linalg.norm(np.array(returns) - np.array(e_returns), axis=-1)
-        return np.array(e_returns), np.array(returns), distances, e_states
+        return np.array(e_returns), np.array(returns), distances, e_states, e_cell_satisfaction
 
     def save(self, filename: str = "PCN_model", savedir: str = "weights"):
         """Save PCN."""
@@ -564,8 +571,17 @@ class PCNTNDP(MOAgent, MOPolicy):
 
             if self.global_step >= (n_checkpoints + 1) * total_timesteps / 100:
                 self.save(savedir=save_dir, filename=f"PCN_model_{n_checkpoints}")
-                e_returns, returns, _, e_states = self.evaluate(eval_env, max_return, n=num_points_pf, starting_loc=starting_loc)
+                e_returns, returns, _, e_states, e_cell_satisfaction = self.evaluate(eval_env, max_return, n=num_points_pf, starting_loc=starting_loc)
                 if self.log:
+                    city = eval_env.unwrapped.city if hasattr(eval_env.unwrapped, 'city') else None
+                    cell_sat = np.array(e_cell_satisfaction) if e_cell_satisfaction else None
+                    cell_dem = None
+                    agg_od = None
+                    house_prices = None
+                    if city is not None and cell_sat is not None and len(cell_sat) > 0:
+                        cell_dem = np.sum(city.od_mx, axis=1) + np.sum(city.od_mx, axis=0)
+                        agg_od = city.agg_od_mx().flatten()
+                        house_prices = getattr(city, 'house_prices', None)
                     log_all_multi_policy_metrics(
                         current_front=e_returns,
                         hv_ref_point=ref_point,
@@ -573,6 +589,10 @@ class PCNTNDP(MOAgent, MOPolicy):
                         global_step=self.global_step,
                         n_sample_weights=num_eval_weights_for_eval,
                         ref_front=known_pareto_front,
+                        cell_satisfaction_rates=cell_sat,
+                        cell_demands=cell_dem,
+                        agg_od_by_cell=agg_od,
+                        house_prices=house_prices,
                     )
 
                     # Offline logger

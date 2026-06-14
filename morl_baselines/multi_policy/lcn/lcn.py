@@ -783,9 +783,11 @@ class LCNTNDP(MOAgent, MOPolicy):
                     cell_sat = np.array(e_cell_satisfaction) if e_cell_satisfaction else None
                     cell_dem = None
                     agg_od = None
+                    house_prices = None
                     if city is not None and cell_sat is not None and len(cell_sat) > 0:
                         cell_dem = np.sum(city.od_mx, axis=1) + np.sum(city.od_mx, axis=0)
                         agg_od = city.agg_od_mx().flatten()
+                        house_prices = getattr(city, 'house_prices', None)
 
                     log_all_multi_policy_metrics(
                         current_front=e_returns,
@@ -797,6 +799,7 @@ class LCNTNDP(MOAgent, MOPolicy):
                         cell_satisfaction_rates=cell_sat,
                         cell_demands=cell_dem,
                         agg_od_by_cell=agg_od,
+                        house_prices=house_prices,
                     )
 
                     # Offline logger
